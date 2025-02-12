@@ -1,32 +1,22 @@
 """Terminal widget implementation."""
 
 from dataclasses import dataclass
-import fcntl
-from typing import Optional, Tuple
-import re
+from typing import List, Optional, Tuple
+from enum import Flag, auto
+import array
 import logging
-from enum import IntEnum
 import struct
-import termios
 
-from PySide6.QtWidgets import QPlainTextEdit, QWidget
-from PySide6.QtCore import Signal, Qt, QTimer, QRect
+from PySide6.QtWidgets import QWidget
+from PySide6.QtCore import Qt, Signal, QRect, QPoint, QTimer
 from PySide6.QtGui import (
-    QTextCursor, QKeyEvent, QFont, QTextCharFormat, QMouseEvent,
-    QTextFormat, QResizeEvent, QFontMetricsF, QFocusEvent, QPainter, QPaintEvent
+    QPainter, QPaintEvent, QColor, QFontMetrics, QFont,
+    QResizeEvent, QKeyEvent, QMouseEvent, QTextCursor,
+    QGuiApplication
 )
 
 from humbug.gui.color_role import ColorRole
 from humbug.gui.style_manager import StyleManager
-
-
-class FormatProperty(IntEnum):
-    """Properties used to track which format attributes are explicit vs default."""
-    CUSTOM_FOREGROUND = QTextFormat.UserProperty
-    CUSTOM_BACKGROUND = QTextFormat.UserProperty + 1
-    CUSTOM_WEIGHT = QTextFormat.UserProperty + 2
-    CUSTOM_ITALIC = QTextFormat.UserProperty + 3
-    CUSTOM_UNDERLINE = QTextFormat.UserProperty + 4
 
 
 @dataclass
@@ -50,1086 +40,956 @@ class TerminalSize:
         return struct.pack('HHHH', self.rows, self.cols, 0, 0)
 
 
-class TerminalWidget(QPlainTextEdit):
-    """Terminal display widget with fixed-width line handling."""
+class CharacterAttributes(Flag):
+    """Bit flags for character attributes."""
+    NONE = 0
+    BOLD = auto()
+    ITALIC = auto()
+    UNDERLINE = auto()
+    STRIKE = auto()
+    HIDDEN = auto()
+    BLINK = auto()
+    INVERSE = auto()
+    DIM = auto()
+    CUSTOM_FG = auto()
+    CUSTOM_BG = auto()
 
-    # Signal emitted when user input is ready
-    data_ready = Signal(bytes)
-    # Signal emitted for mouse events when tracking is enabled
-    mouse_event = Signal(str)
-    size_changed = Signal()
+
+class TerminalLine:
+    """Fixed-width line of terminal characters."""
+    def __init__(self, width: int):
+        """Initialize empty line with given width."""
+        self.width = width
+        # For each character cell we store:
+        # - Unicode codepoint (4 bytes)
+        # - Attributes flags (4 bytes)
+        # - FG color (4 bytes)
+        # - BG color (4 bytes)
+        self.data = array.array('L', [0] * (width * 4))
+
+    def set_character(
+        self,
+        index: int,
+        char: str,
+        attributes: CharacterAttributes = CharacterAttributes.NONE,
+        fg_color: Optional[int] = None,
+        bg_color: Optional[int] = None
+    ):
+        """Set character and attributes at position."""
+        if 0 <= index < self.width:
+            base = index * 4
+            self.data[base] = ord(char)
+            self.data[base + 1] = attributes.value
+            self.data[base + 2] = fg_color if fg_color is not None else 0
+            self.data[base + 3] = bg_color if bg_color is not None else 0
+
+    def get_character(self, index: int) -> Tuple[str, CharacterAttributes, Optional[int], Optional[int]]:
+        """Get character and attributes at position."""
+        if 0 <= index < self.width:
+            base = index * 4
+            char = chr(self.data[base])
+            attributes = CharacterAttributes(self.data[base + 1])
+            fg_color = self.data[base + 2] if self.data[base + 2] != 0 else None
+            bg_color = self.data[base + 3] if self.data[base + 3] != 0 else None
+            return (char, attributes, fg_color, bg_color)
+        return (' ', CharacterAttributes.NONE, None, None)
+
+
+class TerminalWidget(QWidget):
+    """Terminal widget implementation."""
+
+    data_ready = Signal(bytes)  # Emitted when user input is ready
+    size_changed = Signal()  # Emitted when terminal size changes
 
     def __init__(self, parent: Optional[QWidget] = None):
         """Initialize terminal widget."""
         super().__init__(parent)
-        self.setLineWrapMode(QPlainTextEdit.NoWrap)
-
         self._logger = logging.getLogger("TerminalWidget")
         self._style_manager = StyleManager()
 
-        # Set up default text format
-        self._default_text_format = QTextCharFormat()
-        self._update_default_format()
+        # Enable focus and input
+        self.setFocusPolicy(Qt.StrongFocus)
 
-        self._cursor_row = 0  # 0-based row in terminal
-        self._cursor_col = 0  # 0-based column in terminal
-        self._saved_cursor_position = None  # (row, col) tuple when saved
-        self._cursor_visible = False
-        self._cursor_blink_timer = QTimer(self)
-        self._cursor_blink_timer.timeout.connect(self._blink_cursor)
+        # Storage for terminal content
+        self._lines: List[TerminalLine] = []
+        self._viewport_offset = 0  # Lines scrolled up from bottom
 
-        # Hide Qt's cursor since we'll draw our own
-        self.setCursorWidth(0)
+        # Terminal dimensions
+        self._rows = 0
+        self._cols = 0
 
-        # Current text format (initialized to default)
-        self._current_text_format = self._default_text_format
+        self._scroll_region_top = 0
+        self._scroll_region_bottom = self._rows
 
-        # Set up default appearance
-        self.setStyleSheet(f"""
-            QPlainTextEdit {{
-                background-color: {self._style_manager.get_color_str(ColorRole.TAB_BACKGROUND_ACTIVE)};
-                color: {self._style_manager.get_color_str(ColorRole.TEXT_PRIMARY)};
-                border: none;
-            }}
-        """)
+        self._using_alternate_screen = False
+        self._main_screen_buffer = None
+        self._main_screen_cursor = None
+        self._main_screen_attrs = None
+
+        # Window/terminal state
+        self._terminal_title = ""
+        self._current_directory = None
+
+        # Operation modes
+        self._application_keypad_mode = False
+        self._application_cursor_keys = False
+        self._origin_mode = False
+        self._auto_wrap = True
+        self._bracketed_paste = False
+
+        # Mouse handling
+        self._mouse_tracking = False
+        self._mouse_tracking_mode = 0  # 0=off, 1000=normal, 1002=button, 1003=any
+        self._mouse_utf8_mode = False
+        self._mouse_sgr_mode = False
+
+        # Focus tracking
+        self._focus_tracking = False
+
+        # Cursor state
+        self._cursor_row = 0
+        self._cursor_col = 0
+        self._cursor_visible = True
+        self._cursor_blink = True
+        self._saved_cursor = None  # For save/restore cursor position
+
+        # Selection state
+        self._selection_start: Optional[Tuple[int, int]] = None  # (row, col)
+        self._selection_end: Optional[Tuple[int, int]] = None    # (row, col)
+        self._selecting = False
+
+        # Color tables for ANSI colors
+        self._ansi_colors = {
+            # Standard colors (0-7)
+            0: ColorRole.TERM_BLACK,
+            1: ColorRole.TERM_RED,
+            2: ColorRole.TERM_GREEN,
+            3: ColorRole.TERM_YELLOW,
+            4: ColorRole.TERM_BLUE,
+            5: ColorRole.TERM_MAGENTA,
+            6: ColorRole.TERM_CYAN,
+            7: ColorRole.TERM_WHITE,
+
+            # Bright colors (8-15) if needed
+            8: ColorRole.TERM_BRIGHT_BLACK,
+            9: ColorRole.TERM_BRIGHT_RED,
+            10: ColorRole.TERM_BRIGHT_GREEN,
+            11: ColorRole.TERM_BRIGHT_YELLOW,
+            12: ColorRole.TERM_BRIGHT_BLUE,
+            13: ColorRole.TERM_BRIGHT_MAGENTA,
+            14: ColorRole.TERM_BRIGHT_CYAN,
+            15: ColorRole.TERM_BRIGHT_WHITE,
+        }
+
+        # Current rendering attributes
+        self._current_attributes = CharacterAttributes.NONE
+        self._current_fg = None  # Used when CUSTOM_FG is set
+        self._current_bg = None  # Used when CUSTOM_BG is set
 
         # ANSI escape sequence handling
         self._escape_seq_buffer = ""
         self._in_escape_seq = False
-        self._saved_cursor_position = None
 
-        # Additional terminal state
-        self._main_screen_buffer = ""
-        self._main_screen_formats = []
-        self._using_alternate_screen = False
-        self._scroll_region: Optional[Tuple[int, int]] = None
-        self._application_cursor_keys = False
-        self._application_keypad_mode = False
-        self._mouse_tracking = False
-        self._mouse_tracking_sgr = False
-        self._saved_mouse_tracking = False
-        self._saved_mouse_tracking_sgr = False
-        self._bracketed_paste_mode = False
-        self._current_directory = None
+        # Text cursor for selection
+        self._text_cursor = QTextCursor()
+
+        # Default colors (can be customized later)
+        self._default_fg = self._style_manager.get_color(ColorRole.TEXT_PRIMARY)
+        self._default_bg = self._style_manager.get_color(ColorRole.TAB_BACKGROUND_ACTIVE)
+
+        # Blink state
+        self._blink_state = False
+        self._blink_timer = QTimer(self)
+        self._blink_timer.timeout.connect(self._toggle_blink)
+        self._blink_timer.start(500)  # Toggle every 500ms
+
         self._current_size = None
+
+        # Calculate initial size
+        self._update_dimensions()
+        self._initialize_buffer()
 
         # Connect style changed signal
         self._style_manager.style_changed.connect(self._handle_style_changed)
-
-        # Connect to the vertical scrollbar's change signals
-        self._auto_scroll = True
-        self.verticalScrollBar().valueChanged.connect(self._on_scroll_value_changed)
-        self.verticalScrollBar().rangeChanged.connect(self._on_scroll_range_changed)
-
-    def _update_default_format(self):
-        """Update the default text format based on current style."""
-        self._default_text_format = QTextCharFormat()
-        self._default_text_format.setForeground(self._style_manager.get_color(ColorRole.TEXT_PRIMARY))
-        self._default_text_format.setBackground(self._style_manager.get_color(ColorRole.TAB_BACKGROUND_ACTIVE))
-        self._default_text_format.setFontWeight(QFont.Normal)
-        self._default_text_format.setFontUnderline(False)
-        self._default_text_format.setFontItalic(False)
-        self._default_text_format.setFontFixedPitch(True)
-
-        # Clear any custom property markers
-        for prop in FormatProperty:
-            self._default_text_format.setProperty(prop, False)
-
-    def _initialize_buffer(self):
-        """Initialize terminal buffer with empty lines."""
-        if not self._current_size:
-            return
-
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        try:
-            # Pre-allocate active terminal area
-            empty_line = ' ' * self._current_size.cols
-            for _ in range(self._current_size.rows - 1):
-                cursor.insertText(empty_line, self._current_text_format)
-                cursor.insertBlock()
-
-            cursor.insertText(empty_line, self._current_text_format)
-
-        finally:
-            cursor.endEditBlock()
+        self._handle_style_changed()
 
     def _handle_style_changed(self):
         """Handle style changes."""
-        # Update default format
-        self._update_default_format()
-
-        # Update current format while preserving custom properties
-        new_format = QTextCharFormat(self._default_text_format)
-
-        # Check each custom property and preserve if set
-        if self._current_text_format.property(FormatProperty.CUSTOM_FOREGROUND):
-            new_format.setForeground(self._current_text_format.foreground())
-            new_format.setProperty(FormatProperty.CUSTOM_FOREGROUND, True)
-
-        if self._current_text_format.property(FormatProperty.CUSTOM_BACKGROUND):
-            new_format.setBackground(self._current_text_format.background())
-            new_format.setProperty(FormatProperty.CUSTOM_BACKGROUND, True)
-
-        if self._current_text_format.property(FormatProperty.CUSTOM_WEIGHT):
-            new_format.setFontWeight(self._current_text_format.fontWeight())
-            new_format.setProperty(FormatProperty.CUSTOM_WEIGHT, True)
-
-        if self._current_text_format.property(FormatProperty.CUSTOM_ITALIC):
-            new_format.setFontItalic(self._current_text_format.fontItalic())
-            new_format.setProperty(FormatProperty.CUSTOM_ITALIC, True)
-
-        if self._current_text_format.property(FormatProperty.CUSTOM_UNDERLINE):
-            new_format.setFontUnderline(self._current_text_format.fontUnderline())
-            new_format.setProperty(FormatProperty.CUSTOM_UNDERLINE, True)
-
-        self._current_text_format = new_format
-
-        # Update appearance
-        self.setStyleSheet(f"""
-            QPlainTextEdit {{
-                background-color: {self._style_manager.get_color_str(ColorRole.TAB_BACKGROUND_ACTIVE)};
-                color: {self._style_manager.get_color_str(ColorRole.TEXT_PRIMARY)};
-                border: none;
-            }}
-        """)
-
-        # Update colors for all text blocks
-        cursor = self.textCursor()
-        saved_position = cursor.position()
-        cursor.movePosition(QTextCursor.Start)
-
-        while not cursor.atEnd():
-            cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)
-            text_format = cursor.charFormat()
-            new_format = QTextCharFormat(text_format)
-
-            # Only update colors that aren't custom (i.e., are using defaults)
-            if not text_format.property(FormatProperty.CUSTOM_FOREGROUND):
-                new_format.setForeground(self._style_manager.get_color(ColorRole.TEXT_PRIMARY))
-
-            if not text_format.property(FormatProperty.CUSTOM_BACKGROUND):
-                new_format.setBackground(self._style_manager.get_color(ColorRole.TAB_BACKGROUND_ACTIVE))
-
-            cursor.mergeCharFormat(new_format)
-            cursor.clearSelection()
-
-        # Restore cursor position
-        cursor.setPosition(saved_position)
-        self.setTextCursor(cursor)
-
-    def _update_cursor_position(self, row: int, col: int):
-        """
-        Update cursor position and ensure it's within bounds.
-
-        Args:
-            row: Target row (0-based)
-            col: Target column (0-based)
-        """
-        if not self._current_size:
-            return
-
-        # If the cursor was visible before we need to erase it
-        if self._cursor_visible:
-            old_cursor_rect = self._get_cursor_rect()
-            if old_cursor_rect:
-                self.viewport().update(old_cursor_rect)
-
-        # Update cursor position
-        self._cursor_row = max(0, row)
-        self._cursor_col = max(0, col)
-
-        # Update new cursor position if it's visible
-        if (row < self._current_size.rows) and (col < self._current_size.cols):
-            new_cursor_rect = self._get_cursor_rect()
-            if new_cursor_rect:
-                self.viewport().update(new_cursor_rect)
-
-    def _write_char(self, text: str):
-        """
-        Write a character at the current cursor position.
-
-        Args:
-            text: Character to write at current cursor position
-        """
-        # Handle special characters first
-        if text == '\r':
-            self._update_cursor_position(self._cursor_row, 0)
-            return
-        elif text == '\n':
-            if self._cursor_row == self._current_size.rows - 1:
-                self._handle_newline_scroll()
-            else:
-                self._update_cursor_position(self._cursor_row + 1, self._cursor_col)
-            return
-        elif text == '\b':
-            self._update_cursor_position(self._cursor_row, max(0, self._cursor_col - 1))
-            return
-        elif text == '\t':
-            spaces = 8 - (self._cursor_col % 8)
-            new_col = min(self._cursor_col + spaces, self._current_size.cols - 1)
-            self._update_cursor_position(self._cursor_row, new_col)
-            return
-
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        try:
-            # Are we trying to write past the end of the line?  If yes, then wrap
-            if self._cursor_col >= self._current_size.cols:
-                if self._cursor_row < self._current_size.rows - 1:
-                    self._update_cursor_position(self._cursor_row + 1, 0)
-                else:
-                    self._handle_newline_scroll()
-                    self._update_cursor_position(self._cursor_row, 0)
-
-            # Calculate target block by counting back from end of document
-            doc_block_count = self.document().blockCount()
-            target_block = doc_block_count - self._current_size.rows + self._cursor_row
-
-            # Position cursor and insert character
-            cursor.movePosition(QTextCursor.Start)
-            cursor.movePosition(QTextCursor.NextBlock, n=target_block)
-            cursor.movePosition(QTextCursor.Right, n=self._cursor_col)
-
-            # Replace character
-            cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)
-            cursor.insertText(text, self._current_text_format)
-
-            self._update_cursor_position(self._cursor_row, self._cursor_col + 1)
-
-        finally:
-            cursor.endEditBlock()
-
-    def _handle_newline_scroll(self):
-        """
-        Handle scrolling for a newline
-        Args:
-            top: Top line of scroll region (0-based)
-            bottom: Bottom line of scroll region (0-based)
-        """
-        if not self._current_size:
-            return
-
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        # If we're not using an alternate screen the scroll the line at the top of the screen
-        # into the history buffer
-        try:
-            if not self._using_alternate_screen:
-                doc_block_count = self.document().blockCount()
-                target_block = doc_block_count - self._current_size.rows
-                cursor.movePosition(QTextCursor.Start)
-                cursor.movePosition(QTextCursor.NextBlock, n=target_block + 1)
-                cursor.insertBlock()
-
-        finally:
-            cursor.endEditBlock()
-
-        self._scroll_region_up(0, self._current_size.rows - 1)
-
-    def _scroll_region_up(self, top: int, bottom: int):
-        """
-        Scroll the defined region up one line.
-        Args:
-            top: Top line of scroll region (0-based)
-            bottom: Bottom line of scroll region (0-based)
-        """
-        if not self._current_size:
-            return
-
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        try:
-            # Calculate block numbers for the scroll region
-            first_active = max(0, self.document().blockCount() - self._current_size.rows)
-            top_block = first_active + top
-            bottom_block = first_active + bottom
-
-            # Move lines down one by one while maintaining pre-allocation,
-            # starting from bottom to avoid overwriting
-            for block_num in range(top_block, bottom_block, 1):
-                cursor.movePosition(QTextCursor.Start)
-                cursor.movePosition(QTextCursor.NextBlock, n=block_num)
-
-                # Get next line's content
-                next_cursor = QTextCursor(cursor)
-                next_cursor.movePosition(QTextCursor.Start)
-                next_cursor.movePosition(QTextCursor.NextBlock, n=block_num + 1)
-                next_cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-                next_line = next_cursor.selection()
-
-                # Replace current line content
-                cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-                cursor.insertFragment(next_line)
-
-            # Clear the bottom line, keeping pre-allocation
-            cursor.movePosition(QTextCursor.End)
-            cursor.movePosition(QTextCursor.StartOfBlock, QTextCursor.KeepAnchor)
-            cursor.insertText(' ' * self._current_size.cols, self._current_text_format)
-
-        finally:
-            cursor.endEditBlock()
-
-    def _scroll_region_down(self, top: int, bottom: int):
-        """
-        Scroll the defined region down one line.
-        Args:
-            top: Top line of scroll region (0-based)
-            bottom: Bottom line of scroll region (0-based)
-        """
-        if not self._current_size:
-            return
-
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        try:
-            # Calculate block numbers for the scroll region
-            first_active = max(0, self.document().blockCount() - self._current_size.rows)
-            top_block = first_active + top
-            bottom_block = first_active + bottom
-
-            # Move lines down one by one while maintaining pre-allocation,
-            # starting from bottom to avoid overwriting
-            for block_num in range(bottom_block, top_block, -1):
-                cursor.movePosition(QTextCursor.Start)
-                cursor.movePosition(QTextCursor.NextBlock, n=block_num)
-
-                # Get previous line's content
-                prev_cursor = QTextCursor(cursor)
-                prev_cursor.movePosition(QTextCursor.Start)
-                prev_cursor.movePosition(QTextCursor.NextBlock, n=block_num - 1)
-                prev_cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-                prev_line = prev_cursor.selection()
-
-                # Replace current line content
-                cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-                cursor.insertFragment(prev_line)
-
-            # Clear the top line, keeping pre-allocation
-            cursor.movePosition(QTextCursor.Start)
-            cursor.movePosition(QTextCursor.NextBlock, n=top_block)
-            cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
-            cursor.insertText(' ' * self._current_size.cols, self._current_text_format)
-
-        finally:
-            cursor.endEditBlock()
-
-    def _move_cursor_relative(self, rows: int, cols: int):
-        """
-        Move cursor relative to current position.
-
-        Args:
-            rows: Number of rows to move (negative = up)
-            cols: Number of columns to move (negative = left)
-        """
-        self._update_cursor_position(
-            self._cursor_row + rows,
-            self._cursor_col + cols
-        )
-
-    def _handle_cursor_sequence(self, sequence: str):
-        """Handle cursor movement sequences (CUU, CUD, CUF, CUB)."""
-        match = re.match(r'\x1b\[(\d*)([ABCD])', sequence)
-        if not match:
-            self._logger.warning(f"Invalid cursor movement sequence: {sequence}")
-            return
-
-        count = int(match.group(1)) if match.group(1) else 1
-        direction = match.group(2)
-
-        if direction == 'A':  # Up
-            self._move_cursor_relative(-count, 0)
-        elif direction == 'B':  # Down
-            self._move_cursor_relative(count, 0)
-        elif direction == 'C':  # Forward
-            self._move_cursor_relative(0, count)
-        elif direction == 'D':  # Back
-            self._move_cursor_relative(0, -count)
-
-    def _handle_cursor_position(self, params: str):
-        """Handle cursor position (CUP/HVP) sequences."""
-        try:
-            if not params:
-                self._update_cursor_position(0, 0)
-                return
-
-            parts = params.split(';')
-            row = int(parts[0]) - 1  # Convert to 0-based
-            col = int(parts[1]) - 1 if len(parts) > 1 else 0
-
-            self._update_cursor_position(row, col)
-
-        except (ValueError, IndexError) as e:
-            self._logger.warning(f"Invalid cursor position parameters: {params}, error: {e}")
-
-    def _handle_erase_in_display(self, params: str):
-        """Handle erase in display (ED) sequences."""
-        param = params if params else '0'
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        try:
-            # Calculate target position from tracked cursor
-            first_active = max(0, self.document().blockCount() - self._current_size.rows)
-            target_block = first_active + self._cursor_row
-
-            if param == '0':  # Clear from cursor to end of screen
-                # Move Qt cursor to current input position
-                cursor.movePosition(QTextCursor.Start)
-                cursor.movePosition(QTextCursor.NextBlock, n=target_block)
-                cursor.movePosition(QTextCursor.Right, n=self._cursor_col)
-
-                # Clear to end of current line
-                cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
-                cursor.insertText(' ' * (self._current_size.cols - self._cursor_col), self._current_text_format)
-
-                # Clear all lines below
-                total_blocks = self._current_size.rows - (self._cursor_row + 1)
-                for _ in range(total_blocks - 1):
-                    cursor.movePosition(QTextCursor.NextBlock)
-                    cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, n=self._current_size.cols)
-                    cursor.insertText(' ' * self._current_size.cols, self._current_text_format)
-
-            elif param == '1':  # Clear from cursor to beginning of screen
-                cursor.movePosition(QTextCursor.Start)
-                cursor.movePosition(QTextCursor.NextBlock, n=target_block)
-                cursor.movePosition(QTextCursor.Right, n=self._cursor_col)
-                cursor.movePosition(QTextCursor.StartOfLine, QTextCursor.KeepAnchor)
-                cursor.insertText(' ' * self._cursor_col, self._current_text_format)
-
-                # Clear all lines above
-                total_blocks = self._cursor_row - 1
-                for _ in range(total_blocks - 1):
-                    cursor.movePosition(QTextCursor.PreviousBlock)
-                    cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, n=self._current_size.cols)
-                    cursor.insertText(' ' * self._current_size.cols, self._current_text_format)
-
-            elif param == '2':  # Clear entire screen
-                cursor.movePosition(QTextCursor.Start)
-                cursor.movePosition(QTextCursor.NextBlock, n=first_active)
-
-                # Fill with empty lines
-                for _ in range(self._current_size.rows):
-                    cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
-                    cursor.insertText(' ' * self._current_size.cols, self._current_text_format)
-                    cursor.movePosition(QTextCursor.NextBlock)
-
-                self._update_cursor_position(0, 0)
-                if self._auto_scroll:
-                    self._scroll_to_bottom()
-
-            elif param == '3':  # Clear scrollback buffer
-                # Delete the history buffer
-                cursor.movePosition(QTextCursor.Start)
-                cursor.movePosition(QTextCursor.NextBlock, QTextCursor.KeepAnchor, n=first_active)
-                cursor.removeSelectedText()
-
-                # Fill with empty lines
-                for _ in range(self._current_size.rows):
-                    cursor.movePosition(QTextCursor.StartOfLine)
-                    cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
-                    cursor.insertText(' ' * self._current_size.cols, self._current_text_format)
-                    cursor.movePosition(QTextCursor.NextBlock)
-
-                self._update_cursor_position(0, 0)
-                if self._auto_scroll:
-                    self._scroll_to_bottom()
-
-        finally:
-            cursor.endEditBlock()
-            self.setTextCursor(cursor)
-
-    def _handle_erase_in_line(self, params: str):
-        """Handle erase in line (EL) sequences."""
-        param = params if params else '0'
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        try:
-            # Calculate target position from tracked cursor
-            first_visible = self.firstVisibleBlock().blockNumber()
-            target_block = first_visible + self._cursor_row
-
-            # Move Qt cursor to current input position
-            cursor.movePosition(QTextCursor.Start)
-            cursor.movePosition(QTextCursor.NextBlock, n=target_block)
-            cursor.movePosition(QTextCursor.Right, n=self._cursor_col)
-
-            if param == '0':  # Clear from cursor to end of line
-                cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
-                cursor.insertText(' ' * (self._current_size.cols - self._cursor_col), self._current_text_format)
-            elif param == '1':  # Clear from cursor to start of line
-                cursor.movePosition(QTextCursor.StartOfLine, QTextCursor.KeepAnchor)
-                cursor.insertText(' ' * self._cursor_col, self._current_text_format)
-            elif param == '2':  # Clear entire line
-                cursor.movePosition(QTextCursor.StartOfLine)
-                cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
-                cursor.insertText(' ' * self._current_size.cols, self._current_text_format)
-
-        finally:
-            cursor.endEditBlock()
-            self.setTextCursor(cursor)
-
-    def _handle_insert_lines(self, params: str):
-        """Handle insert lines operation."""
-        count = int(params) if params else 1
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        try:
-            # Calculate target position from tracked cursor
-            first_visible = self.firstVisibleBlock().blockNumber()
-            target_block = first_visible + self._cursor_row
-
-            # Move Qt cursor to current input position
-            cursor.movePosition(QTextCursor.Start)
-            cursor.movePosition(QTextCursor.NextBlock, n=target_block)
-            cursor.movePosition(QTextCursor.Right, n=self._cursor_col)
-
-            current_row = self._cursor_row
-            for _ in range(count):
-                # Move content down
-                self._scroll_region_down(current_row, self._current_size.rows - 1)
-
-            # Cursor moves to the first position on the row
-            self._update_cursor_position(self._cursor_row, 0)
-
-        finally:
-            cursor.endEditBlock()
-
-    def _handle_delete_lines(self, params: str):
-        """Handle delete lines operation."""
-        count = int(params) if params else 1
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        try:
-            # Calculate target position from tracked cursor
-            first_visible = self.firstVisibleBlock().blockNumber()
-            target_block = first_visible + self._cursor_row
-
-            # Move Qt cursor to current input position
-            cursor.movePosition(QTextCursor.Start)
-            cursor.movePosition(QTextCursor.NextBlock, n=target_block)
-            cursor.movePosition(QTextCursor.Right, n=self._cursor_col)
-
-            current_row = self._cursor_row
-            for _ in range(count):
-                # Move content down
-                self._scroll_region_up(current_row, self._current_size.rows - 1)
-
-            # Cursor moves to the first position on the row
-            self._update_cursor_position(self._cursor_row, 0)
-
-        finally:
-            cursor.endEditBlock()
-
-    def _handle_insert_characters(self, params: str):
-        """Handle insert characters operation."""
-        count = int(params) if params else 1
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        try:
-            # Calculate target position from tracked cursor
-            first_visible = self.firstVisibleBlock().blockNumber()
-            target_block = first_visible + self._cursor_row
-
-            # Move Qt cursor to current input position
-            cursor.movePosition(QTextCursor.Start)
-            cursor.movePosition(QTextCursor.NextBlock, n=target_block)
-            cursor.movePosition(QTextCursor.Right, n=self._cursor_col)
-
-            remaining_space = self._current_size.cols - self._cursor_col
-            insert_count = min(count, remaining_space)
-
-            # Select characters to shift
-            cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, remaining_space)
-            existing_text = cursor.selectedText()
-# Needs to preserve attributes using .selection()
-
-            # Overwrite with spaces and shifted text
-            cursor.setPosition(cursor.block().position() + self._cursor_col)
-            for i in range(insert_count):
-                cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)
-                cursor.insertText(' ', self._current_text_format)
-
-            # Write shifted text
-            shifted_text = existing_text[:remaining_space - insert_count]
-            for char in shifted_text:
-                cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)
-                cursor.insertText(char, self._current_text_format)
-
-        finally:
-            cursor.endEditBlock()
-
-    def _handle_delete_characters(self, params: str):
-        """Handle delete characters operation."""
-        count = int(params) if params else 1
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        try:
-            # Calculate target position from tracked cursor
-            first_visible = self.firstVisibleBlock().blockNumber()
-            target_block = first_visible + self._cursor_row
-
-            # Move Qt cursor to current input position
-            cursor.movePosition(QTextCursor.Start)
-            cursor.movePosition(QTextCursor.NextBlock, n=target_block)
-            cursor.movePosition(QTextCursor.Right, n=self._cursor_col)
-
-            # Select and remove characters, filling with spaces
-            for i in range(count):
-                if self._cursor_col + i < self._current_size.cols:
-                    cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)
-                    cursor.insertText(' ', self._current_text_format)
-
-        finally:
-            cursor.endEditBlock()
-
-    def _handle_sgr_sequence(self, params: str):
-        """Handle Select Graphic Rendition (SGR) sequences."""
-        if not params:
-            params = '0'  # Reset to default
-
-        # Start with a copy of the current format
-        current_format = QTextCharFormat(self._current_text_format)
-
-        for param in params.split(';'):
-            try:
-                code = int(param)
-            except ValueError:
-                continue
-
-            if code == 0:  # Reset all attributes
-                current_format = QTextCharFormat(self._default_text_format)
-                # Clear all custom property markers
-                for prop in FormatProperty:
-                    current_format.setProperty(prop, False)
-
-            elif code == 1:  # Bold
-                current_format.setFontWeight(QFont.Bold)
-                current_format.setProperty(FormatProperty.CUSTOM_WEIGHT, True)
-
-            elif code == 2:  # Faint
-                current_format.setFontWeight(QFont.Light)
-                current_format.setProperty(FormatProperty.CUSTOM_WEIGHT, True)
-
-            elif code == 3:  # Italic
-                current_format.setFontItalic(True)
-                current_format.setProperty(FormatProperty.CUSTOM_ITALIC, True)
-
-            elif code == 4:  # Underline
-                current_format.setFontUnderline(True)
-                current_format.setProperty(FormatProperty.CUSTOM_UNDERLINE, True)
-
-            elif code == 22:  # Normal intensity
-                current_format.setFontWeight(QFont.Normal)
-                current_format.setProperty(FormatProperty.CUSTOM_WEIGHT, False)
-
-            elif code == 23:  # Not italic
-                current_format.setFontItalic(False)
-                current_format.setProperty(FormatProperty.CUSTOM_ITALIC, False)
-
-            elif code == 24:  # Not underlined
-                current_format.setFontUnderline(False)
-                current_format.setProperty(FormatProperty.CUSTOM_UNDERLINE, False)
-
-            elif code == 39:  # Default foreground color
-                current_format.setForeground(self._style_manager.get_color(ColorRole.TEXT_PRIMARY))
-                current_format.setProperty(FormatProperty.CUSTOM_FOREGROUND, False)
-
-            elif code == 49:  # Default background color
-                current_format.setBackground(self._style_manager.get_color(ColorRole.TAB_BACKGROUND_ACTIVE))
-                current_format.setProperty(FormatProperty.CUSTOM_BACKGROUND, False)
-
-            # Foreground colors
-            elif 30 <= code <= 37:
-                color_roles = [
-                    ColorRole.TERM_BLACK,
-                    ColorRole.TERM_RED,
-                    ColorRole.TERM_GREEN,
-                    ColorRole.TERM_YELLOW,
-                    ColorRole.TERM_BLUE,
-                    ColorRole.TERM_MAGENTA,
-                    ColorRole.TERM_CYAN,
-                    ColorRole.TERM_WHITE
-                ]
-                current_format.setForeground(self._style_manager.get_color(color_roles[code - 30]))
-                current_format.setProperty(FormatProperty.CUSTOM_FOREGROUND, True)
-
-            # Bright foreground colors
-            elif 90 <= code <= 97:
-                color_roles = [
-                    ColorRole.TERM_BRIGHT_BLACK,
-                    ColorRole.TERM_BRIGHT_RED,
-                    ColorRole.TERM_BRIGHT_GREEN,
-                    ColorRole.TERM_BRIGHT_YELLOW,
-                    ColorRole.TERM_BRIGHT_BLUE,
-                    ColorRole.TERM_BRIGHT_MAGENTA,
-                    ColorRole.TERM_BRIGHT_CYAN,
-                    ColorRole.TERM_BRIGHT_WHITE
-                ]
-                current_format.setForeground(self._style_manager.get_color(color_roles[code - 90]))
-                current_format.setProperty(FormatProperty.CUSTOM_FOREGROUND, True)
-
-            # Background colors
-            elif 40 <= code <= 47:
-                color_roles = [
-                    ColorRole.TERM_BLACK,
-                    ColorRole.TERM_RED,
-                    ColorRole.TERM_GREEN,
-                    ColorRole.TERM_YELLOW,
-                    ColorRole.TERM_BLUE,
-                    ColorRole.TERM_MAGENTA,
-                    ColorRole.TERM_CYAN,
-                    ColorRole.TERM_WHITE
-                ]
-                current_format.setBackground(self._style_manager.get_color(color_roles[code - 40]))
-                current_format.setProperty(FormatProperty.CUSTOM_BACKGROUND, True)
-
-            # Bright background colors
-            elif 100 <= code <= 107:
-                color_roles = [
-                    ColorRole.TERM_BRIGHT_BLACK,
-                    ColorRole.TERM_BRIGHT_RED,
-                    ColorRole.TERM_BRIGHT_GREEN,
-                    ColorRole.TERM_BRIGHT_YELLOW,
-                    ColorRole.TERM_BRIGHT_BLUE,
-                    ColorRole.TERM_BRIGHT_MAGENTA,
-                    ColorRole.TERM_BRIGHT_CYAN,
-                    ColorRole.TERM_BRIGHT_WHITE
-                ]
-                current_format.setBackground(self._style_manager.get_color(color_roles[code - 100]))
-                current_format.setProperty(FormatProperty.CUSTOM_BACKGROUND, True)
-
-            else:
-                print(f"SGR code {code} - not handled")
-                self._logger.debug(f"SGR code {code} - not handled")
-
-        self._current_text_format = current_format
-
-    def _handle_screen_buffer_switch(self, enable_alternate: bool):
-        """Handle switching between main and alternate screen buffers."""
-        if enable_alternate == self._using_alternate_screen:
-            return
-
-        if enable_alternate:
-            # Save main screen content and cursor position
-            self._main_screen_buffer = self.toPlainText()
-            self._saved_cursor_position = (
-                self._cursor_row,
-                self._cursor_col
-            )
-
-            # Clear screen for alternate buffer
-            cursor = self.textCursor()
-            cursor.beginEditBlock()
-            cursor.movePosition(QTextCursor.Start)
-            cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
-            cursor.removeSelectedText()
-            cursor.endEditBlock()
-            self._initialize_buffer()
-
-            self._update_cursor_position(0, 0)
-
-            self._using_alternate_screen = True
-        else:
-            # Restore main screen
-            cursor = self.textCursor()
-            cursor.beginEditBlock()
-            cursor.movePosition(QTextCursor.Start)
-            cursor.movePosition(QTextCursor.End, QTextCursor.KeepAnchor)
-            cursor.insertText(self._main_screen_buffer)
-            cursor.endEditBlock()
-
-            # Restore cursor position
-            if self._saved_cursor_position:
-                row, col = self._saved_cursor_position
-                self._update_cursor_position(row, col)
-
-            # We need to reflow in case the dimensions changed from when we saved things
-#            self._reflow_content()
-
-            self._using_alternate_screen = False
-
-    def _calculate_size(self) -> TerminalSize:
+        # Update terminal font
+        font = QFont(self._style_manager.monospace_font_families)
+        base_size = self._style_manager.base_font_size
+        font.setPointSizeF(base_size * self._style_manager.zoom_factor)
+        self.setFont(font)
+
+        # Update default colors from style manager
+        self._default_fg = self._style_manager.get_color(ColorRole.TEXT_PRIMARY).rgb()
+        self._default_bg = self._style_manager.get_color(ColorRole.TAB_BACKGROUND_ACTIVE).rgb()
+
+        # Force redraw with new colors
+        self.update()
+
+    def calculate_size(self) -> TerminalSize:
         """Calculate current terminal size in rows and columns."""
-        fm = QFontMetricsF(self.font())
-        char_width = int(fm.horizontalAdvance(' ') + 0.999)
-        char_height = int(fm.height() + 0.999)
+        fm = QFontMetrics(self.font())
+        char_width = fm.horizontalAdvance(' ')
+        char_height = fm.height()
 
-        if char_width == 0 or char_height == 0:
+        if char_width <= 0 or char_height <= 0:
             self._logger.warning(f"Invalid character dimensions: width={char_width}, height={char_height}")
             return TerminalSize(24, 80)  # Default fallback size
 
-        viewport = self.viewport()
-        viewport_width = viewport.width()
-        viewport_height = viewport.height() - int(self.contentOffset().y() * 2)
+        viewport_width = self.width()
+        viewport_height = self.height()
 
-        # Calculate rows and columns
         cols = max(viewport_width // char_width, 1)
         rows = max(viewport_height // char_height, 1)
 
-        if self._current_size is None:
-            self._current_size = TerminalSize(rows, cols)
-            self._initialize_buffer()
-
         return TerminalSize(rows, cols)
 
-    def _blink_cursor(self):
-        """Toggle cursor visibility for blinking effect."""
-        self._cursor_visible = not self._cursor_visible
-        # Only force update of the cursor area
-        cursor_rect = self._get_cursor_rect()
-        if cursor_rect:
-            self.viewport().update(cursor_rect)
+    def _update_dimensions(self) -> None:
+        """Update terminal dimensions based on widget size and font metrics."""
+        new_size = self.calculate_size()
 
-    def _get_cursor_rect(self) -> Optional[QRect]:
-        """
-        Get the rectangle where the cursor should be drawn.
+        if new_size.cols != self._cols or new_size.rows != self._rows:
+            old_rows, old_cols = self._rows, self._cols
+            self._rows, self._cols = new_size.rows, new_size.cols
 
-        Returns:
-            QRect: Rectangle defining cursor position and size, or None if dimensions invalid
+            # Calculate scroll region adjustments
+            if old_rows > 0 and old_cols > 0:
+                # Calculate the relative positions of scroll regions
+                old_top_ratio = self._scroll_region_top / old_rows
+                old_bottom_ratio = self._scroll_region_bottom / old_rows
 
-        Note:
-            Coordinates are in viewport coordinates relative to the widget
-        """
-        if not self._current_size:
-            return None
+                # Adjust scroll region to maintain relative positioning
+                self._scroll_region_top = min(
+                    round(old_top_ratio * self._rows),
+                    self._rows - 1
+                )
+                self._scroll_region_bottom = min(
+                    round(old_bottom_ratio * self._rows),
+                    self._rows
+                )
 
-        cursor = self.textCursor()
-        first_active = max(0, self.document().blockCount() - self._current_size.rows)
-        target_block = first_active + self._cursor_row
+                # Ensure minimum scroll region size of 1 line
+                if self._scroll_region_bottom <= self._scroll_region_top:
+                    self._scroll_region_bottom = min(
+                        self._scroll_region_top + 1,
+                        self._rows
+                    )
 
-        cursor.movePosition(QTextCursor.Start)
-        cursor.movePosition(QTextCursor.NextBlock, n=target_block)
-        cursor.movePosition(QTextCursor.Right, n=self._cursor_col)
+                self._reflow_content(old_rows, old_cols)
 
-        rect = self.cursorRect(cursor)
+            else:
+                # Initial setup - scroll region is full terminal
+                self._scroll_region_top = 0
+                self._scroll_region_bottom = self._rows
 
-        # Get basic character metrics
-        fm = QFontMetricsF(self.font())
-        rect.setWidth(round(fm.horizontalAdvance(' ')))
-        return rect
-
-    def paintEvent(self, event: QPaintEvent):
-        """
-        Handle widget painting including cursor.
-
-        Args:
-            event: Paint event containing region to update
-        """
-        # Let Qt handle normal text rendering
-        super().paintEvent(event)
-
-        # Only draw cursor if visible
-        if not self._cursor_visible:
-            return
-
-        cursor_rect = self._get_cursor_rect()
-        if not cursor_rect or not cursor_rect.intersects(event.rect()):
-            return
-
-        # Get text cursor at input position to read character/format
-        cursor = self.textCursor()
-        first_visible = self.firstVisibleBlock().blockNumber()
-        target_block = first_visible + self._cursor_row
-
-        cursor.movePosition(QTextCursor.Start)
-        cursor.movePosition(QTextCursor.NextBlock, n=target_block)
-#        cursor.movePosition(QTextCursor.StartOfLine)
-        cursor.movePosition(QTextCursor.Right, n=self._cursor_col)
-
-        # Get character under cursor
-        cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor)
-        char = cursor.selectedText()
-        char_format = cursor.charFormat()
-
-        painter = QPainter(self.viewport())
-
-        # Get colors for inversion
-        fg_color = char_format.foreground().color()
-        bg_color = char_format.background().color()
-
-        if not char or char == ' ':
-            # Just draw solid cursor for empty space
-            painter.fillRect(cursor_rect, self.palette().text())
-        else:
-            # Draw inverted cursor with character
-            painter.fillRect(cursor_rect, fg_color)  # Use text color as background
-            painter.setPen(bg_color)  # Use background color as text color
-            painter.setFont(self.font())
-            painter.drawText(cursor_rect, 0, char)
-
-    def _position_qt_cursor_at_input(self) -> QTextCursor:
-        """Position Qt cursor at current input cursor position.
-
-        Returns:
-            QTextCursor: Cursor positioned at current input location
-        """
-        cursor = self.textCursor()
-        first_active = max(0, self.document().blockCount() - self._current_size.rows)
-        target_block = first_active + self._cursor_row
-
-        cursor.movePosition(QTextCursor.Start)
-        cursor.movePosition(QTextCursor.NextBlock, n=target_block)
-        cursor.movePosition(QTextCursor.Right, n=self._cursor_col)
-
-        return cursor
-
-    def mousePressEvent(self, event: QMouseEvent):
-        """Handle mouse events for selection."""
-        if self._mouse_tracking:
-            # Mouse tracking code remains the same
-            pass
-        else:
-            # Let Qt handle text selection normally
-            super().mousePressEvent(event)
-
-        event.accept()
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        """Handle mouse movement for selection."""
-        if not self._mouse_tracking:
-            super().mouseMoveEvent(event)
-        event.accept()
-
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        """Handle mouse release for selection."""
-        if self._mouse_tracking:
-            # Mouse tracking code remains the same
-            pass
-        else:
-            super().mouseReleaseEvent(event)
-        event.accept()
-
-    def resizeEvent(self, event: QResizeEvent):
-        """Handle resize events."""
-        super().resizeEvent(event)
-        new_size = self._calculate_size()
-
-        if self._current_size != new_size:
-            old_size = self._current_size
-            self._current_size = new_size
-            self._logger.debug(
-                f"Terminal size changed: {old_size} -> {new_size}"
-            )
-            self._reflow_content(old_size, new_size)
             self.size_changed.emit()
 
-        if self._auto_scroll:
-            self._scroll_to_bottom()
+    def _initialize_buffer(self) -> None:
+        """Initialize empty terminal buffer."""
+        # Create initial lines
+        self._lines = []
+        print(f"init buffer {self._rows}")
+        self._add_new_lines(self._rows)
 
-    def focusInEvent(self, event: QFocusEvent):
-        """Handle focus in to start cursor blinking."""
-        super().focusInEvent(event)
-        self._cursor_blink_timer.start(500)
-        self._cursor_visible = True
-        self.viewport().update()
+    def _add_new_lines(self, count: int) -> None:
+        """Add new empty lines to the buffer."""
+        for _ in range(count):
+            line = TerminalLine(self._cols)
+            # Fill line with spaces using default attributes
+            for i in range(self._cols):
+                line.set_character(i, ' ')
 
-    def focusOutEvent(self, event: QFocusEvent):
-        """Handle focus out to stop cursor blinking."""
-        super().focusOutEvent(event)
-        self._cursor_blink_timer.stop()
-        self._cursor_visible = False
-        self.viewport().update()
+            self._lines.append(line)
 
-    def _reflow_content(self, old_size: Optional[TerminalSize], new_size: TerminalSize):
-        """Reflow terminal content for new dimensions."""
-        if not old_size:
-            return
-
-        print("reflow start")
-        doc_rows = self.document().blockCount()
-        new_rows = new_size.rows
-        old_rows = old_size.rows
-
-        cursor = self.textCursor()
-        cursor.beginEditBlock()
-
-        try:
-            # Process each line
-            cursor.movePosition(QTextCursor.Start)
-            while not cursor.atEnd():
-                # Pad or truncate line to new width
-                if old_size.cols < new_size.cols:
-                    cursor.movePosition(QTextCursor.EndOfLine)
-                    cursor.insertText(' ' * (new_size.cols - old_size.cols), self._current_text_format)
-                elif old_size.cols > new_size.cols:
-                    cursor.movePosition(QTextCursor.Right, n=new_size.cols)
-                    cursor.movePosition(QTextCursor.EndOfLine, QTextCursor.KeepAnchor)
-                    cursor.removeSelectedText()
-                else:
-                    cursor.movePosition(QTextCursor.EndOfLine)
-
-                # Move to next line
-                if not cursor.atEnd():
-                    cursor.movePosition(QTextCursor.NextBlock)
-
-            if doc_rows < new_rows:
-                # Pre-allocate active terminal area
-                empty_line = ' ' * new_size.cols
-                for _ in range(new_rows - doc_rows):
-                    cursor.insertBlock()
-                    cursor.insertText(empty_line, self._current_text_format)
-
-                # We've added more padding at the end so we need to ensure the cursor doesn't get moved down
-                old_rows = new_rows
-
-        finally:
-            cursor.endEditBlock()
-
-        # Adjust cursor position if needed
-        self._update_cursor_position(
-            max(0, self._cursor_row - old_rows + new_rows),
-            min(self._cursor_col, new_size.cols - 1)
-        )
-
-        # Force cursor area update
-        cursor_rect = self._get_cursor_rect()
-        if cursor_rect:
-            self.viewport().update(cursor_rect)
-
-    def update_pty_size(self, fd: int) -> None:
-        """Update PTY size using current terminal dimensions.
+    def _xterm_to_rgb(self, color_index: int) -> int:
+        """
+        Convert xterm-256 color index to RGB value.
 
         Args:
-            fd: File descriptor for PTY
+            color_index: Color index from 0-255
 
-        Raises:
-            OSError: If ioctl call fails
+        Returns:
+            32-bit RGB color value (0x00RRGGBB format)
+
+        The xterm-256 color scheme consists of:
+        - Colors 0-15: Standard ANSI colors (handled by _ansi_colors)
+        - Colors 16-231: 6x6x6 RGB color cube
+        - Colors 232-255: Grayscale colors
         """
+        # Use color table for standard colors (0-15)
+        if color_index < 16:
+            color_role = self._ansi_colors[color_index]
+            return self._style_manager.get_color(color_role).rgb()
+
+        # Handle 6x6x6 color cube (indices 16-231)
+        if color_index < 232:
+            # Remove the 16 basic colors offset
+            color_index -= 16
+
+            # Extract RGB components
+            # Each component has 6 possible values: 0, 95, 135, 175, 215, 255
+            blue = color_index % 6
+            green = (color_index // 6) % 6
+            red = color_index // 36
+
+            # Convert to actual RGB values
+            # The formula converts index (0-5) to actual color value
+            def component_to_value(component: int) -> int:
+                if component == 0:
+                    return 0
+                return 40 * component + 55
+
+            r = component_to_value(red)
+            g = component_to_value(green)
+            b = component_to_value(blue)
+
+            return (r << 16) | (g << 8) | b
+
+        # Handle grayscale colors (indices 232-255)
+        # These are evenly spaced from dark to light
+        # First gray (232) is 8,8,8
+        # Last gray (255) is 238,238,238
+        gray_value = 8 + (color_index - 232) * 10
+        return (gray_value << 16) | (gray_value << 8) | gray_value
+
+    def _handle_selection_data(self, param: str):
+        """Handle OSC 52 selection data operations."""
         try:
-            size = self._calculate_size()
-            fcntl.ioctl(fd, termios.TIOCSWINSZ, size.to_struct())
-        except OSError as e:
-            self._logger.error(f"Failed to update PTY size: {e}")
-            raise
+            clipboard, data = param.split(';', 1)
+            if clipboard in ('c', 'p', 's'):  # Primary, clipboard, or secondary selection
+                if data == '?':  # Query
+                    # Should emit response with current selection
+                    pass
+                elif data:  # Set
+                    # Base64 decode data and update clipboard
+                    import base64
+                    decoded = base64.b64decode(data).decode('utf-8')
+                    if clipboard == 'c':
+                        QGuiApplication.clipboard().setText(decoded)
+                else:  # Clear
+                    if clipboard == 'c':
+                        QGuiApplication.clipboard().clear()
+        except (ValueError, base64.Error) as e:
+            self._logger.warning(f"Invalid selection data: {param}")
 
-    def insertFromMimeData(self, source):
-        """Handle paste events with support for bracketed paste mode."""
-        if source.hasText():
-            text = source.text()
-            if self._bracketed_paste_mode:
-                # Wrap the pasted text in bracketed paste sequences
-                self.data_ready.emit(b'\x1b[200~')
-                self.data_ready.emit(text.encode())
-                self.data_ready.emit(b'\x1b[201~')
+    def _process_osc(self, sequence: str):
+        """Handle Operating System Command sequences."""
+        # Remove ESC] prefix and terminator (BEL or ST)
+        if sequence.endswith('\x07'):  # BEL
+            params = sequence[2:-1]
+        elif sequence.endswith('\x1b\\'):  # ST
+            params = sequence[2:-2]
+        else:
+            return
+
+        try:
+            # Split into command number and parameter
+            parts = params.split(';', 1)
+            command = int(parts[0])
+            param = parts[1] if len(parts) > 1 else ''
+
+            if command == 0:  # Set window title and icon name
+#                self.window_title_changed.emit(param)
+                pass
+
+            elif command == 1:  # Set icon name only
+#                self.icon_name_changed.emit(param)
+                pass
+
+            elif command == 2:  # Set window title only
+#                self.window_title_changed.emit(param)
+                pass
+
+            elif command == 4:  # Change/query color number
+                # Format: 4;index;spec
+                color_parts = param.split(';')
+                if len(color_parts) >= 2:
+                    index = int(color_parts[0])
+                    if len(color_parts) == 1:  # Query
+                        # Should emit response with current color
+                        pass
+                    else:  # Set
+                        color_spec = color_parts[1]
+                        # Parse color spec and update color table
+#                        self._update_color(index, color_spec)
+
+            elif command == 7:  # Set working directory
+                self._current_directory = param
+
+            elif command in (10, 11, 12, 13, 14, 15, 16, 17, 19):  # Set/query various resources
+                # 10: text foreground
+                # 11: text background
+                # etc.
+                if param == '?':  # Query
+                    # Should emit response with current value
+                    pass
+                else:
+                    self._update_terminal_resource(command, param)
+
+            elif command == 52:  # Manipulate selection data
+                # Handle clipboard operations
+                self._handle_selection_data(param)
+
+            elif command == 104:  # Reset color number
+                if param:  # Reset specific colors
+                    for spec in param.split(';'):
+                        try:
+                            index = int(spec)
+#                            self._reset_color(index)
+                        except ValueError:
+                            pass
+                else:  # Reset all colors
+#                    self._reset_all_colors()
+                    pass
+
+            elif command == 110:  # Reset text foreground color
+#                self._reset_color(10)
+                pass
+
+            elif command == 111:  # Reset text background color
+#                self._reset_color(11)
+                pass
+
+            elif command == 112:  # Reset text cursor color
+#                self._reset_color(12)
+                pass
+
+        except (ValueError, IndexError) as e:
+            self._logger.warning(f"Invalid OSC sequence: {sequence}, error: {e}")
+
+    def _handle_alternate_screen(self, enable: bool):
+        """Switch between main and alternate screen buffers."""
+        if enable == self._using_alternate_screen:
+            return
+
+        if enable:
+            # Save main screen state
+            self._main_screen_buffer = self._lines[:]
+            self._main_screen_cursor = (self._cursor_row, self._cursor_col)
+            self._main_screen_attrs = {
+                'fg': self._current_fg,
+                'bg': self._current_bg,
+                'attrs': self._current_attributes
+            }
+
+            # Clear and initialize alternate screen
+            self._lines = []
+            self._add_new_lines(self._rows)
+            self._cursor_row = 0
+            self._cursor_col = 0
+
+        else:
+            # Restore main screen
+            self._lines = self._main_screen_buffer
+            self._cursor_row, self._cursor_col = self._main_screen_cursor
+            self._current_fg = self._main_screen_attrs['fg']
+            self._current_bg = self._main_screen_attrs['bg']
+            self._current_attributes = self._main_screen_attrs['attrs']
+
+        self._using_alternate_screen = enable
+        self.update()
+
+    def _process_private_mode(self, params: str, set_mode: bool):
+        """Handle DEC private mode sequences (DECSET/DECRST)."""
+        try:
+            modes = [int(x) for x in params.split(';')]
+            for mode in modes:
+                if mode == 1:  # DECCKM - Application Cursor Keys
+                    self._application_cursor_keys = set_mode
+                elif mode == 3:  # DECCOLM - 80/132 Column Mode
+                    # In xterm this changes column count but for now we'll ignore
+                    pass
+                elif mode == 6:  # DECOM - Origin Mode
+                    self._origin_mode = set_mode
+                    if set_mode:
+                        self._cursor_row = self._scroll_region_top
+                        self._cursor_col = 0
+                elif mode == 7:  # DECAWM - Auto-wrap Mode
+                    self._auto_wrap = set_mode
+                elif mode == 12:  # att610 - Start/Stop Blinking Cursor
+                    self._cursor_blink = set_mode
+                elif mode == 25:  # DECTCEM - Text Cursor Enable Mode
+                    self._cursor_visible = set_mode
+                elif mode == 1000:  # X11 mouse reporting - normal tracking mode
+                    self._mouse_tracking = set_mode
+                    self._mouse_tracking_mode = 1000 if set_mode else 0
+                elif mode == 1002:  # X11 mouse reporting - button event tracking
+                    self._mouse_tracking = set_mode
+                    self._mouse_tracking_mode = 1002 if set_mode else 0
+                elif mode == 1003:  # X11 mouse reporting - any event tracking
+                    self._mouse_tracking = set_mode
+                    self._mouse_tracking_mode = 1003 if set_mode else 0
+                elif mode == 1004:  # Send focus in/out events
+                    self._focus_tracking = set_mode
+                elif mode == 1005:  # UTF-8 mouse mode
+                    self._mouse_utf8_mode = set_mode
+                elif mode == 1006:  # SGR mouse mode
+                    self._mouse_sgr_mode = set_mode
+                elif mode == 1047:  # Use Alternate Screen Buffer
+                    self._handle_alternate_screen(set_mode)
+                elif mode == 1048:  # Save/Restore cursor
+                    if set_mode:
+#                        self._save_cursor()
+                        pass
+                    else:
+#                        self._restore_cursor()
+                        pass
+                elif mode == 1049:  # Alternate Screen + save/restore cursor
+                    if set_mode:
+#                        self._save_cursor()
+                        self._handle_alternate_screen(True)
+                    else:
+                        self._handle_alternate_screen(False)
+#                        self._restore_cursor()
+                elif mode == 2004:  # Bracketed paste mode
+                    self._bracketed_paste = set_mode
+        except ValueError as e:
+            self._logger.warning(f"Invalid private mode parameter: {params}")
+
+    def _process_sgr(self, params: list[int]) -> None:
+        """Process SGR (Select Graphic Rendition) sequence."""
+        i = 0
+        while i < len(params):
+            param = params[i]
+
+            if param == 0:  # Reset
+                self._current_attributes = CharacterAttributes.NONE
+                self._current_fg = None
+                self._current_bg = None
+
+            elif param == 1:  # Bold
+                self._current_attributes |= CharacterAttributes.BOLD
+
+            elif param == 2:  # Dim
+                self._current_attributes |= CharacterAttributes.DIM
+
+            elif param == 3:  # Italic
+                self._current_attributes |= CharacterAttributes.ITALIC
+
+            elif param == 4:  # Underline
+                self._current_attributes |= CharacterAttributes.UNDERLINE
+
+            elif param == 5:  # Blink
+                self._current_attributes |= CharacterAttributes.BLINK
+
+            elif param == 7:  # Inverse
+                self._current_attributes |= CharacterAttributes.INVERSE
+
+            elif param == 8:  # Hidden
+                self._current_attributes |= CharacterAttributes.HIDDEN
+
+            elif param == 9:  # Strike
+                self._current_attributes |= CharacterAttributes.STRIKE
+
+            elif 30 <= param <= 37:  # Standard foreground color
+                self._current_attributes |= CharacterAttributes.CUSTOM_FG
+                color_role = self._ansi_colors[param - 30]
+                self._current_fg = self._style_manager.get_color(color_role).rgb()
+
+            elif 40 <= param <= 47:  # Standard background color
+                self._current_attributes |= CharacterAttributes.CUSTOM_BG
+                color_role = self._ansi_colors[param - 40]
+                self._current_bg = self._style_manager.get_color(color_role).rgb()
+
+            elif param == 38:  # Extended foreground color
+                if i + 2 < len(params):
+                    if params[i + 1] == 5:  # 256 colors
+                        color_index = params[i + 2]
+                        if color_index < 16:  # Use our color table for first 16 colors
+                            self._current_attributes |= CharacterAttributes.CUSTOM_FG
+                            color_role = self._ansi_colors[color_index]
+                            self._current_fg = self._style_manager.get_color(color_role).rgb()
+                        else:
+                            # For other colors, construct RGB directly
+                            self._current_attributes |= CharacterAttributes.CUSTOM_FG
+                            self._current_fg = self._xterm_to_rgb(color_index)
+                        i += 2
+                    elif params[i + 1] == 2 and i + 4 < len(params):  # RGB
+                        r, g, b = params[i + 2:i + 5]
+                        self._current_attributes |= CharacterAttributes.CUSTOM_FG
+                        self._current_fg = (r << 16) | (g << 8) | b
+                        i += 4
+
+            elif param == 48:  # Extended background color
+                if i + 2 < len(params):
+                    if params[i + 1] == 5:  # 256 colors
+                        color_index = params[i + 2]
+                        if color_index < 16:  # Use our color table for first 16 colors
+                            self._current_attributes |= CharacterAttributes.CUSTOM_BG
+                            color_role = self._ansi_colors[color_index]
+                            self._current_bg = self._style_manager.get_color(color_role).rgb()
+                        else:
+                            # For other colors, construct RGB directly
+                            self._current_attributes |= CharacterAttributes.CUSTOM_BG
+                            self._current_bg = self._xterm_to_rgb(color_index)
+                        i += 2
+                    elif params[i + 1] == 2 and i + 4 < len(params):  # RGB
+                        r, g, b = params[i + 2:i + 5]
+                        self._current_attributes |= CharacterAttributes.CUSTOM_BG
+                        self._current_bg = (r << 16) | (g << 8) | b
+                        i += 4
+
+            i += 1
+
+    def _clear_region(self, start_row, start_col, end_row, end_col):
+        """Clear a rectangular region of the terminal."""
+        for row in range(start_row, end_row + 1):
+            line_index = len(self._lines) - self._rows + row
+            if 0 <= line_index < len(self._lines):
+                line = self._lines[line_index]
+                start = start_col if row == start_row else 0
+                end = end_col if row == end_row else self._cols - 1
+                for col in range(start, end + 1):
+                    line.set_character(col, ' ')
+
+    def _process_escape_sequence(self, sequence: str) -> None:
+        """Process ANSI escape sequence."""
+        # OSC sequences
+        if sequence.startswith('\x1b]'):
+            self._process_osc(sequence)
+            return
+
+        # Private mode sequences
+        if sequence.startswith('\x1b[?'):
+            code = sequence[-1]
+            params = sequence[3:-1]  # Remove ESC[? and final character
+            if code == 'h':
+                self._process_private_mode(params, True)
+            elif code == 'l':
+                self._process_private_mode(params, False)
+            return
+
+        # CSI sequences
+        if sequence.startswith('\x1b['):
+            code = sequence[-1]
+            print(f"escape code {code}")
+            # Parse just what we need based on the sequence
+            if code == 'A':  # Up
+                param = sequence[2:-1]
+                amount = int(param) if param.isdigit() else 1
+                self._cursor_row = max(0, self._cursor_row - amount)
+
+            elif code == 'B':  # Down
+                param = sequence[2:-1]
+                amount = int(param) if param.isdigit() else 1
+                self._cursor_row = min(self._rows - 1, self._cursor_row + amount)
+
+            elif code == 'C':  # Forward
+                param = sequence[2:-1]
+                amount = int(param) if param.isdigit() else 1
+                self._cursor_col = min(self._cols - 1, self._cursor_col + amount)
+
+            elif code == 'D':  # Backward
+                param = sequence[2:-1]
+                amount = int(param) if param.isdigit() else 1
+                self._cursor_col = max(0, self._cursor_col - amount)
+
+            elif code == 'G':  # CHA - Cursor Horizontal Absolute
+                param = sequence[2:-1]
+                col = max(0, int(param) - 1) if param.isdigit() else 1  # Convert 1-based to 0-based
+                self._cursor_col = min(col, self._cols - 1)
+
+            elif code == 'H':  # Cursor position
+                pos = sequence[2:-1].split(';')
+                row = int(pos[0]) if pos and pos[0].isdigit() else 1
+                col = int(pos[1]) if len(pos) > 1 and pos[1].isdigit() else 1
+                self._cursor_row = min(self._rows - 1, max(0, row - 1))  # Convert to 0-based
+                self._cursor_col = min(self._cols - 1, max(0, col - 1))
+
+            elif code == 'J':  # Clear screen
+                param = sequence[2:-1]
+                mode = int(param) if param.isdigit() else 0
+                if mode == 0:  # Clear from cursor to end
+                    self._clear_region(
+                        self._cursor_row,
+                        self._cursor_col,
+                        self._rows - 1,
+                        self._cols - 1
+                    )
+                elif mode == 1:  # Clear from start to cursor
+                    self._clear_region(0, 0, self._cursor_row, self._cursor_col)
+                elif mode == 2:  # Clear entire screen
+                    self._clear_region(0, 0, self._rows - 1, self._cols - 1)
+
+            elif code == 'K':  # Clear line
+                param = sequence[2:-1]
+                mode = int(param) if param.isdigit() else 0
+                if mode == 0:  # Clear from cursor to end
+                    self._clear_region(
+                        self._cursor_row,
+                        self._cursor_col,
+                        self._cursor_row,
+                        self._cols - 1
+                    )
+                elif mode == 1:  # Clear from start to cursor
+                    self._clear_region(
+                        self._cursor_row,
+                        0,
+                        self._cursor_row,
+                        self._cursor_col
+                    )
+                elif mode == 2:  # Clear entire line
+                    self._clear_region(
+                        self._cursor_row,
+                        0,
+                        self._cursor_row,
+                        self._cols - 1
+                    )
+
+            elif code == 'L':  # IL - Insert Line
+                param = sequence[2:-1]
+                count = max(1, int(param) if param.isdigit() else 0)
+                self._insert_lines(count)
+
+            elif code == 'M':  # DL - Delete Line
+                param = sequence[2:-1]
+                count = max(1, int(param) if param.isdigit() else 0)
+                self._delete_lines(count)
+
+            elif code == 'P':  # DCH - Delete Character
+                param = sequence[2:-1]
+                count = max(1, int(param) if param.isdigit() else 0)
+                self._delete_chars(count)
+
+            elif code == 'S':  # SU - Scroll Up
+                param = sequence[2:-1]
+                count = max(1, int(param) if param.isdigit() else 0)
+                self._scroll_up(count)
+
+            elif code == 'T':  # SD - Scroll Down
+                param = sequence[2:-1]
+                count = max(1, int(param) if param.isdigit() else 0)
+                self._scroll_down(count)
+
+            elif code == 'X':  # ECH - Erase Character
+                param = sequence[2:-1]
+                count = max(1, int(param) if param.isdigit() else 0)
+                self._erase_chars(count)
+
+            elif code == '@':  # ICH - Insert Character
+                param = sequence[2:-1]
+                count = max(1, int(param) if param.isdigit() else 0)
+                self._insert_chars(count)
+
+            elif code == 'd':  # VPA - Line Position Absolute
+                param = sequence[2:-1]
+                row = max(0, int(param) - 1) if param.isdigit() else 1 # Convert 1-based to 0-based
+                self._cursor_row = min(row, self._rows - 1)
+
+            elif code == 'f':  # HVP - Horizontal & Vertical Position
+                pos = sequence[2:-1].split(';')
+                row = int(pos[0]) if pos and pos[0].isdigit() else 1
+                col = int(pos[1]) if len(pos) > 1 and pos[1].isdigit() else 1
+                self._cursor_row = min(self._rows - 1, max(0, row - 1))  # Convert to 0-based
+                self._cursor_col = min(self._cols - 1, max(0, col - 1))
+
+            elif code == 'm':  # SGR - Select Graphic Rendition
+                params = sequence[2:-1].split(';')
+                params = [int(p) if p.isdigit() else 0 for p in params]
+                self._process_sgr(params)
+
+            elif code == 'r':  # DECSTBM - Set Scrolling Region
+                params = sequence[2:-1].split(';')
+                top = max(0, int(params[0]) - 1) if params and params[0].isdigit() else 0
+                bottom = min(self._rows, int(params[1])) if len(params) > 1 and params[1].isdigit() else self._rows
+                if top < bottom:
+                    self._scroll_region_top = top
+                    self._scroll_region_bottom = bottom
+                    self._cursor_row = 0
+                    self._cursor_col = 0
+
+            elif code == 's':  # Save cursor position
+                self._saved_cursor = (self._cursor_row, self._cursor_col)
+
+            elif code == 'u':  # Restore cursor position
+                if self._saved_cursor:
+                    self._cursor_row, self._cursor_col = self._saved_cursor
+
+        # Simple escape sequences
+        elif len(sequence) == 2:
+            if sequence[1] == 'M':  # Reverse Index
+                if self._cursor_row == 0:
+                    self._add_new_lines(1)
+                else:
+                    self._cursor_row -= 1
+            elif sequence[1] == 'D':  # Index
+                if self._cursor_row == self._rows - 1:
+                    self._add_new_lines(1)
+                else:
+                    self._cursor_row += 1
+            elif sequence[1] == 'E':  # Next Line
+                if self._cursor_row == self._rows - 1:
+                    self._add_new_lines(1)
+                else:
+                    self._cursor_row += 1
+                self._cursor_col = 0
+
+    def _insert_lines(self, count: int) -> None:
+        """Insert blank lines at cursor position."""
+        if not (self._scroll_region_top <= self._cursor_row < self._scroll_region_bottom):
+            return
+
+        # Calculate lines to move
+        start = len(self._lines) - self._rows + self._cursor_row
+        end = len(self._lines) - self._rows + self._scroll_region_bottom
+
+        # Create new blank lines
+        new_lines = []
+        for _ in range(count):
+            line = TerminalLine(self._cols)
+            for col in range(self._cols):
+                line.set_character(col, ' ')
+            new_lines.append(line)
+
+        # Insert new lines and remove excess
+        self._lines[start:start] = new_lines
+        self._lines[end:end + count] = []
+
+    def _delete_lines(self, count: int) -> None:
+        """Delete lines at cursor position."""
+        if not (self._scroll_region_top <= self._cursor_row < self._scroll_region_bottom):
+            return
+
+        # Calculate lines to remove
+        start = len(self._lines) - self._rows + self._cursor_row
+        end = len(self._lines) - self._rows + self._scroll_region_bottom
+
+        # Remove lines and add blank lines at bottom
+        del self._lines[start:min(start + count, end)]
+        for _ in range(count):
+            line = TerminalLine(self._cols)
+            for col in range(self._cols):
+                line.set_character(col, ' ')
+            self._lines.insert(end, line)
+
+    def _insert_chars(self, count: int) -> None:
+        """Insert blank characters at cursor position."""
+        line_index = len(self._lines) - self._rows + self._cursor_row
+        if 0 <= line_index < len(self._lines):
+            line = self._lines[line_index]
+            # Move existing characters right
+            for col in range(self._cols - 1, self._cursor_col - 1, -1):
+                if col >= self._cursor_col + count:
+                    char, attrs, fg, bg = line.get_character(col - count)
+                    line.set_character(col, char, attrs, fg, bg)
+
+            # Insert spaces
+            for col in range(self._cursor_col, min(self._cursor_col + count, self._cols)):
+                line.set_character(col, ' ')
+
+    def _delete_chars(self, count: int) -> None:
+        """Delete characters at cursor position."""
+        line_index = len(self._lines) - self._rows + self._cursor_row
+        if 0 <= line_index < len(self._lines):
+            line = self._lines[line_index]
+            # Move characters left
+            for col in range(self._cursor_col, self._cols):
+                if col + count < self._cols:
+                    char, attrs, fg, bg = line.get_character(col + count)
+                    line.set_character(col, char, attrs, fg, bg)
+                else:
+                    line.set_character(col, ' ')
+
+    def _erase_chars(self, count: int) -> None:
+        """Erase characters at cursor position."""
+        line_index = len(self._lines) - self._rows + self._cursor_row
+        if 0 <= line_index < len(self._lines):
+            line = self._lines[line_index]
+            for col in range(self._cursor_col, min(self._cursor_col + count, self._cols)):
+                line.set_character(col, ' ')
+
+    def _scroll_up(self, count: int) -> None:
+        """Scroll up within current scroll region."""
+        if self._scroll_region_top >= self._scroll_region_bottom:
+            return
+
+        # Calculate actual lines in scroll region
+        start = len(self._lines) - self._rows + self._scroll_region_top
+        end = len(self._lines) - self._rows + self._scroll_region_bottom
+
+        # Remove lines from top and add blank lines at bottom
+        del self._lines[start:min(start + count, end)]
+        for _ in range(count):
+            line = TerminalLine(self._cols)
+            for col in range(self._cols):
+                line.set_character(col, ' ')
+            self._lines.insert(end, line)
+
+    def _scroll_down(self, count: int) -> None:
+        """Scroll down within current scroll region."""
+        if self._scroll_region_top >= self._scroll_region_bottom:
+            return
+
+        # Calculate actual lines in scroll region
+        start = len(self._lines) - self._rows + self._scroll_region_top
+        end = len(self._lines) - self._rows + self._scroll_region_bottom
+
+        # Remove lines from bottom and add blank lines at top
+        del self._lines[max(start, end - count):end]
+        for _ in range(count):
+            line = TerminalLine(self._cols)
+            for col in range(self._cols):
+                line.set_character(col, ' ')
+            self._lines.insert(start, line)
+
+    def _write_char(self, char: str) -> None:
+        """Write a single character at the current cursor position."""
+        if char == '\r':
+            self._cursor_col = 0
+            return
+
+        if char == '\n':
+            if self._cursor_row == self._rows - 1:
+                # Add new line to history and scroll
+                self._add_new_lines(1)
             else:
-                self.data_ready.emit(text.encode())
+                self._cursor_row += 1
+            return
 
-    def clear(self):
-        """Clear the terminal."""
-        self._handle_erase_in_display('2')
+        if char == '\b':
+            self._cursor_col = max(0, self._cursor_col - 1)
+            return
 
-    def put_data(self, data: bytes):
+        if char == '\t':
+            # Move to next tab stop (every 8 columns)
+            spaces = 8 - (self._cursor_col % 8)
+            self._cursor_col = min(self._cursor_col + spaces, self._cols - 1)
+            return
+
+        # Handle printable characters
+        if ord(char) >= 32:
+            # Get current line
+            print(f"write char {repr(char)} {len(self._lines)} {self._rows}")
+            line_index = len(self._lines) - self._rows + self._cursor_row
+            if line_index >= 0 and line_index < len(self._lines):
+                print(f"update line {line_index} {self._cursor_col}")
+                line = self._lines[line_index]
+
+                # Write character
+                line.set_character(
+                    self._cursor_col,
+                    char,
+                    self._current_attributes,
+                    self._current_fg if self._current_attributes & CharacterAttributes.CUSTOM_FG else None,
+                    self._current_bg if self._current_attributes & CharacterAttributes.CUSTOM_BG else None
+                )
+
+                # Move cursor
+                self._cursor_col += 1
+                if self._cursor_col >= self._cols:
+                    self._cursor_col = 0
+                    if self._cursor_row < self._rows - 1:
+                        self._cursor_row += 1
+                    else:
+                        # Add new line and scroll
+                        self._add_new_lines(1)
+
+                # Update the affected area
+                self.update()
+
+    def put_data(self, data: bytes) -> None:
         """Display received data with ANSI sequence handling.
 
         Args:
@@ -1139,7 +999,7 @@ class TerminalWidget(QPlainTextEdit):
             UnicodeDecodeError: If data cannot be decoded
         """
         if not self._current_size:
-            self._current_size = self._calculate_size()
+            self._current_size = self.calculate_size()
 
         text = data.decode(errors='replace')
 
@@ -1193,6 +1053,176 @@ class TerminalWidget(QPlainTextEdit):
 
         # Simple ESC sequences
         return len(sequence) == 2 and sequence[1] in '=>\7\\8cDEHM'
+
+    def _reflow_content(self, old_rows: int, old_cols: int) -> None:
+        """Reflow terminal content for new dimensions."""
+        # Create new lines with new width
+        new_lines = []
+        print(f"reflow {old_rows},{old_cols} -> {self._rows},{self._cols}")
+
+        # Copy content from old lines, truncating or padding as needed
+        for old_line in self._lines:
+            new_line = TerminalLine(self._cols)
+
+            # Copy existing characters
+            for col in range(min(old_cols, self._cols)):
+                char, attributes, fg_color, bg_color = old_line.get_character(col)
+                new_line.set_character(col, char, attributes, fg_color, bg_color)
+
+            # Pad with empty characters if needed
+            for col in range(old_cols, self._cols):
+                new_line.set_character(col, ' ')
+
+            new_lines.append(new_line)
+
+        # Add additional empty lines if needed
+        lines_needed = self._rows - len(new_lines)
+        if lines_needed > 0:
+            for _ in range(lines_needed):
+                new_line = TerminalLine(self._cols)
+                for col in range(self._cols):
+                    new_line.set_character(col, ' ')
+
+                new_lines.append(new_line)
+
+        self._lines = new_lines
+
+        # Update cursor position if needed
+        self._cursor_col = min(self._cursor_col, self._cols - 1)
+        self._cursor_row = min(self._cursor_row, self._rows - 1)
+
+        # Ensure scroll region stays within bounds
+        if self._scroll_region_bottom > self._rows:
+            self._scroll_region_bottom = self._rows
+            if self._scroll_region_top >= self._scroll_region_bottom:
+                self._scroll_region_top = max(0, self._scroll_region_bottom - 1)
+
+        # Force complete repaint
+        self.update()
+
+    def _pixel_pos_to_text_pos(self, pos: QPoint) -> Tuple[int, int]:
+        """Convert pixel coordinates to text position."""
+        fm = QFontMetrics(self.font())
+        char_width = fm.horizontalAdvance(' ')
+        char_height = fm.height()
+
+        col = max(0, min(pos.x() // char_width, self._cols - 1))
+        row = max(0, min(pos.y() // char_height, self._rows - 1))
+
+        return (row, col)
+
+    def _make_sgr_mouse_report(self, row: int, col: int, button: Qt.MouseButton, pressed: bool) -> str:
+        """Create an SGR mouse report."""
+        btn_num = {
+            Qt.LeftButton: 0,
+            Qt.MiddleButton: 1,
+            Qt.RightButton: 2
+        }.get(button, 3)
+
+        if not pressed:
+            btn_num += 3
+
+        return f"\x1b[<{btn_num};{col + 1};{row + 1}{'M' if pressed else 'm'}"
+
+    def _make_normal_mouse_report(self, row: int, col: int, button: Qt.MouseButton) -> str:
+        """Create a normal X10/X11 mouse report."""
+        btn_num = {
+            Qt.LeftButton: 0,
+            Qt.MiddleButton: 1,
+            Qt.RightButton: 2
+        }.get(button, 3)
+
+        # Ensure values fit in a byte
+        cb = 32 + btn_num
+        cx = 32 + min(255, col + 1)
+        cy = 32 + min(255, row + 1)
+
+        return f"\x1b[M{chr(cb)}{chr(cx)}{chr(cy)}"
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse press for both tracking and selection."""
+        if event.button() == Qt.LeftButton:
+            # Handle text selection
+            self._selecting = True
+            pos = self._pixel_pos_to_text_pos(event.position().toPoint())
+            self._selection_start = pos
+            self._selection_end = pos
+            self._update_text_cursor()
+            self.update()
+
+        # Handle mouse tracking if enabled
+        if self._mouse_tracking:
+            pos = event.position().toPoint()
+            button = event.button()
+            row, col = self._pixel_pos_to_text_pos(pos)
+
+            # Construct mouse report based on mode
+            if self._mouse_sgr_mode:
+                report = self._make_sgr_mouse_report(row, col, button, True)
+            else:
+                report = self._make_normal_mouse_report(row, col, button)
+
+            if report:
+                self.data_ready.emit(report.encode())
+
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse release for both tracking and selection."""
+        if event.button() == Qt.LeftButton:
+            self._selecting = False
+
+        # Handle mouse tracking if enabled
+        if self._mouse_tracking:
+            pos = event.position().toPoint()
+            button = event.button()
+            row, col = self._pixel_pos_to_text_pos(pos)
+
+            if self._mouse_sgr_mode:
+                report = self._make_sgr_mouse_report(row, col, button, False)
+                if report:
+                    self.data_ready.emit(report.encode())
+
+        super().mouseReleaseEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        """Handle mouse movement for selection and tracking."""
+        # Handle text selection
+        if self._selecting:
+            pos = self._pixel_pos_to_text_pos(event.position().toPoint())
+            if pos != self._selection_end:
+                self._selection_end = pos
+                self._update_text_cursor()
+                self.update()
+
+        # Handle mouse tracking if enabled and in button event mode (1002) or any event mode (1003)
+        if self._mouse_tracking and self._mouse_tracking_mode in (1002, 1003):
+            row, col = self._pixel_pos_to_text_pos(event.position().toPoint())
+            buttons = event.buttons()
+
+            # For 1002 mode, only report if buttons are pressed
+            if self._mouse_tracking_mode == 1002 and not buttons:
+                return
+
+            btn_num = 32  # Default to button release
+            if buttons & Qt.LeftButton:
+                btn_num = 32
+            elif buttons & Qt.MiddleButton:
+                btn_num = 33
+            elif buttons & Qt.RightButton:
+                btn_num = 34
+
+            if self._mouse_sgr_mode:
+                report = f"\x1b[<{btn_num};{col + 1};{row + 1}M"
+            else:
+                cb = 32 + btn_num
+                cx = 32 + min(255, col + 1)
+                cy = 32 + min(255, row + 1)
+                report = f"\x1b[M{chr(cb)}{chr(cx)}{chr(cy)}"
+
+            self.data_ready.emit(report.encode())
+
+        super().mouseMoveEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent):
         """Handle key press events including control sequences."""
@@ -1260,14 +1290,6 @@ class TerminalWidget(QPlainTextEdit):
                 self.data_ready.emit(b'\x1bOC')
             elif key == Qt.Key_Left:
                 self.data_ready.emit(b'\x1bOD')
-            elif key == Qt.Key_Return or key == Qt.Key_Enter:
-                self.data_ready.emit(b'\r')
-            elif key == Qt.Key_Backspace:
-                self.data_ready.emit(b'\x7f' if modifiers & Qt.ControlModifier else b'\b')
-            elif key == Qt.Key_Delete:
-                self.data_ready.emit(b'\x1b[3~')
-            elif text:
-                self.data_ready.emit(text.encode())
         else:
             # Normal mode key handling
             if key == Qt.Key_Up:
@@ -1278,308 +1300,322 @@ class TerminalWidget(QPlainTextEdit):
                 self.data_ready.emit(b'\x1b[C')
             elif key == Qt.Key_Left:
                 self.data_ready.emit(b'\x1b[D')
-            elif key == Qt.Key_Return or key == Qt.Key_Enter:
-                self.data_ready.emit(b'\r')
-            elif key == Qt.Key_Backspace:
-                self.data_ready.emit(b'\x7f' if modifiers & Qt.ControlModifier else b'\b')
-            elif key == Qt.Key_Delete:
-                self.data_ready.emit(b'\x1b[3~')
-            elif key == Qt.Key_Tab:
-                self.data_ready.emit(b'\t')
-            elif text:
-                self.data_ready.emit(text.encode())
+
+        if key == Qt.Key_Return or key == Qt.Key_Enter:
+            self.data_ready.emit(b'\r')
+        elif key == Qt.Key_Backspace:
+            self.data_ready.emit(b'\x7f' if modifiers & Qt.ControlModifier else b'\b')
+        elif key == Qt.Key_Delete:
+            self.data_ready.emit(b'\x1b[3~')
+        elif key == Qt.Key_Tab:
+            self.data_ready.emit(b'\t')
+        elif text:
+            self.data_ready.emit(text.encode())
 
         event.accept()
 
-    def _process_escape_sequence(self, sequence: str):
-        """Handle ANSI escape sequences.
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        """Handle resize events."""
+        super().resizeEvent(event)
+        print("resizeevent")
+        self._update_dimensions()
 
-        Args:
-            sequence: The complete escape sequence starting with ESC
-        """
-        # Handle OSC sequences first
-        if sequence.startswith('\x1b]'):
-            if self._handle_osc_sequence(sequence):
-                return
+    def _toggle_blink(self):
+        """Toggle blink state and update display if needed."""
+        old_state = self._blink_state
+        self._blink_state = not self._blink_state
+        # Only update if we have any blinking characters
+        if any(any((line.get_character(col)[1] & CharacterAttributes.BLINK)
+                for col in range(self._cols))
+                for line in self._lines[-self._rows:]):
+            self.update()
 
-        # Handle Control Sequence Introducer (CSI) sequences
-        if sequence.startswith('\x1b['):
-            # Extract the command and parameters
-            command = sequence[-1]
-            params = sequence[2:-1]  # Remove ESC[ and command char
+    def _draw_character(
+        self,
+        painter: QPainter,
+        x: int,
+        y: int,
+        char: str,
+        attributes: CharacterAttributes,
+        fg_color: Optional[int],
+        bg_color: Optional[int],
+        char_width: int,
+        char_height: int,
+        fm: QFontMetrics
+    ) -> None:
+        """Draw a single character cell with attributes."""
+        # Handle inverse video by swapping colors
+        if attributes & CharacterAttributes.INVERSE:
+            if fg_color is not None or bg_color is not None:
+                fg_color, bg_color = bg_color, fg_color
+            else:
+                fg_color, bg_color = self._default_bg, self._default_fg
 
-            # Handle based on command type
-            if command in 'ABCD':
-                self._handle_cursor_sequence(sequence)
-                return
+        # Draw background
+        bg = QColor(bg_color) if bg_color is not None and (attributes & CharacterAttributes.CUSTOM_BG) else QColor(self._default_bg)
+        painter.fillRect(QRect(x, y, char_width, char_height), bg)
 
-            if command in 'Hf':
-                self._handle_cursor_position(params)
-                return
+        # Handle hidden text by using background color for foreground
+        if attributes & CharacterAttributes.HIDDEN:
+            fg_color = bg_color if bg_color is not None else self._default_bg
 
-            if command == 'J':
-                self._handle_erase_in_display(params)
-                return
+        # Set up font attributes
+        font = painter.font()
+        font.setBold(bool(attributes & CharacterAttributes.BOLD))
+        font.setItalic(bool(attributes & CharacterAttributes.ITALIC))
+        font.setUnderline(bool(attributes & CharacterAttributes.UNDERLINE))
+        font.setStrikeOut(bool(attributes & CharacterAttributes.STRIKE))
 
-            if command == 'K':
-                self._handle_erase_in_line(params)
-                return
+        # Handle dim text by using alpha channel
+        if attributes & CharacterAttributes.DIM:
+            fg = QColor(fg_color) if fg_color is not None and (attributes & CharacterAttributes.CUSTOM_FG) else QColor(self._default_fg)
+            fg.setAlpha(128)  # 50% opacity
+            painter.setPen(fg)
+        else:
+            fg = QColor(fg_color) if fg_color is not None and (attributes & CharacterAttributes.CUSTOM_FG) else QColor(self._default_fg)
+            painter.setPen(fg)
 
-            if command in '@':
-                self._handle_insert_characters(params)
-                return
+        painter.setFont(font)
 
-            if command in 'P':
-                self._handle_delete_characters(params)
-                return
+        # Draw the character
+        # Note: Blinking would be handled by a timer updating the visibility
+        if not (attributes & CharacterAttributes.BLINK and self._blink_state):
+            painter.drawText(x, y + fm.ascent(), char)
 
-            if command in 'L':
-                self._handle_insert_lines(params)
-                return
+    def paintEvent(self, event: QPaintEvent) -> None:
+        """Handle paint events efficiently."""
+        print("paint event")
+        painter = QPainter(self)
 
-            if command in 'M':
-                self._handle_delete_lines(params)
-                return
+        # Get font metrics for character dimensions
+        fm = QFontMetrics(self.font())
+        char_width = fm.horizontalAdvance(' ')
+        char_height = fm.height()
 
-            if command == 'm':
-                self._handle_sgr_sequence(params)
-                return
+        # Get the region that needs repainting
+        region = event.rect()
 
-            if command == 'n':
-                self._handle_device_status(params)
-                return
+        # Calculate the character cell range to repaint
+        start_row = max(0, region.top() // char_height)
+        end_row = min(self._rows, (region.bottom() + char_height - 1) // char_height)
+        start_col = max(0, region.left() // char_width)
+        end_col = min(self._cols, (region.right() + char_width - 1) // char_width)
 
-            if command == 'c':
-                self._handle_device_attributes(params)
-                return
+        # Paint visible character cells
+        for row in range(start_row, end_row):
+            y = row * char_height
 
-            if command == 'g':
-                self._handle_tab_control(params)
-                return
+            # Get actual line index accounting for scroll position
+            line_index = len(self._lines) - self._rows + row
+            if line_index < 0 or line_index >= len(self._lines):
+                continue
 
-            if command == 'r':
-                self._handle_scroll_region(params)
-                return
+            line = self._lines[line_index]
 
-            if command in 'hl':
-                self._handle_mode_setting(command, params)
-                return
+            for col in range(start_col, end_col):
+                x = col * char_width
 
-        # Handle keypad mode sequences
-        if sequence == '\x1b=':  # Enable application keypad mode
-            self._application_keypad_mode = True
+                # Get character
+                char, attributes, fg_color, bg_color = line.get_character(col)
+                self._draw_character(painter, x, y, char, attributes, fg_color, bg_color,
+                                    char_width, char_height, fm)
+
+        # Draw selection if active
+        if self._selection_start and self._selection_end:
+            start_row, start_col = self._selection_start
+            end_row, end_col = self._selection_end
+
+            # Ensure start is before end
+            if (start_row > end_row) or (start_row == end_row and start_col > end_col):
+                start_row, start_col, end_row, end_col = end_row, end_col, start_row, start_col
+
+            selection_color = self.palette().highlight().color()
+            selection_text_color = self.palette().highlightedText().color()
+
+            for row in range(max(start_row, 0), min(end_row + 1, self._rows)):
+                if row < start_row or row > end_row:
+                    continue
+
+                y = row * char_height
+
+                # Calculate selection range for this row
+                row_start = start_col if row == start_row else 0
+                row_end = end_col if row == end_row else self._cols
+
+                # Draw selection background
+                selection_rect = QRect(
+                    row_start * char_width,
+                    y,
+                    (row_end - row_start) * char_width,
+                    char_height
+                )
+
+                if selection_rect.intersects(event.rect()):
+                    painter.fillRect(selection_rect, selection_color)
+
+                    # Draw selected text
+                    line_index = len(self._lines) - self._rows + row
+                    if 0 <= line_index < len(self._lines):
+                        line = self._lines[line_index]
+                        for col in range(row_start, row_end):
+                            x = col * char_width
+                            char, attributes, _fg_color, _bg_color = line.get_character(col)
+
+                            # Set up font attributes
+                            font = painter.font()
+                            if attributes & CharacterAttributes.BOLD:
+                                font.setBold(True)
+                            if attributes & CharacterAttributes.ITALIC:
+                                font.setItalic(True)
+                            if attributes & CharacterAttributes.UNDERLINE:
+                                font.setUnderline(True)
+
+                            painter.setFont(font)
+
+                            # Draw with selection colors
+                            painter.setPen(selection_text_color)
+                            painter.drawText(x, y + fm.ascent(), char)
+
+        # Draw cursor if visible
+        if self._cursor_visible and self._viewport_offset == 0:
+            cursor_x = self._cursor_col * char_width
+            cursor_y = self._cursor_row * char_height
+
+            if QRect(cursor_x, cursor_y, char_width, char_height).intersects(region):
+                # Get character under cursor for inversion
+                line_index = len(self._lines) - self._rows + self._cursor_row
+                if 0 <= line_index < len(self._lines):
+                    line = self._lines[line_index]
+                    char, _attributes, _fg_color, _bg_color = line.get_character(self._cursor_col)
+
+                    # Draw inverted cursor block
+                    painter.fillRect(
+                        cursor_x, cursor_y, char_width, char_height,
+                        self.palette().text().color()
+                    )
+
+                    # Draw character in inverted colors
+                    painter.setPen(self.palette().base().color())
+                    painter.drawText(
+                        cursor_x,
+                        cursor_y + fm.ascent(),
+                        char
+                    )
+
+    def _update_text_cursor(self) -> None:
+        """Update text cursor based on selection state."""
+        if not self._selection_start or not self._selection_end:
+            self._text_cursor = QTextCursor()
             return
 
-        if sequence == '\x1b>':  # Disable application keypad mode
-            self._application_keypad_mode = False
+        # Create a cursor that represents the selection
+        cursor = QTextCursor()
+        cursor.setPosition(0)  # Start position
+
+        # Calculate selection range
+        start_row, start_col = self._selection_start
+        end_row, end_col = self._selection_end
+
+        # Ensure start is before end
+        if (start_row > end_row) or (start_row == end_row and start_col > end_col):
+            start_row, start_col, end_row, end_col = end_row, end_col, start_row, start_col
+
+        cursor.setPosition(start_row * self._cols + start_col)
+        cursor.setPosition(end_row * self._cols + end_col, QTextCursor.KeepAnchor)
+
+        self._text_cursor = cursor
+
+    def _get_selected_text(self) -> str:
+        """Get currently selected text."""
+        if not self._selection_start or not self._selection_end:
+            return ""
+
+        # Calculate selection range
+        start_row, start_col = self._selection_start
+        end_row, end_col = self._selection_end
+
+        # Ensure start is before end
+        if (start_row > end_row) or (start_row == end_row and start_col > end_col):
+            start_row, start_col, end_row, end_col = end_row, end_col, start_row, start_col
+
+        # Build selected text
+        text = []
+        for row in range(start_row, end_row + 1):
+            line_index = len(self._lines) - self._rows + row
+            if 0 <= line_index < len(self._lines):
+                line = self._lines[line_index]
+
+                start = start_col if row == start_row else 0
+                end = end_col if row == end_row else self._cols
+
+                row_text = ""
+                for col in range(start, end):
+                    char, _attributes, _fg_color, _bg_color = line.get_character(col)
+                    row_text += char
+
+                text.append(row_text.rstrip())  # Remove trailing spaces
+
+        return "\n".join(text)
+
+    def _clear_selection(self) -> None:
+        """Clear current selection."""
+        self._selection_start = None
+        self._selection_end = None
+        self._update_text_cursor()
+        self.update()
+
+    # Interface methods required by TerminalTab
+    def textCursor(self) -> QTextCursor:
+        """Return current text cursor (for compatibility with QPlainTextEdit)."""
+        return self._text_cursor
+
+    def setTextCursor(self, cursor: QTextCursor) -> None:
+        """Set text cursor (for compatibility with QPlainTextEdit)."""
+        self._text_cursor = cursor
+        self.update()
+
+    def cut(self) -> None:
+        """Cut selected text to clipboard."""
+        self.copy()
+        self._clear_selection()
+
+    def copy(self) -> None:
+        """Copy selected text to clipboard."""
+        if not self._selection_start or not self._selection_end:
             return
 
-        # Handle single-character sequences
-        if len(sequence) == 2:  # ESC + one character
-            if self._handle_simple_sequence(sequence[1]):
-                return
+        # Get selected text
+        text = self._get_selected_text()
+        if text:
+            QGuiApplication.clipboard().setText(text)
 
-        self._logger.warning(f"Unhandled escape sequence: {sequence}")
+    def paste(self) -> None:
+        """Paste text from clipboard."""
+        text = QGuiApplication.clipboard().text()
+        if text:
+            self.put_data(text.encode())
 
-    def _handle_device_status(self, params: str):
-        """Handle Device Status Report (DSR) sequences."""
-        if params == '5':  # Device status report
-            self.data_ready.emit(b'\x1b[0n')  # Device OK
-        elif params == '6':  # Cursor position report
-            cursor = self.textCursor()
-            row = cursor.blockNumber() - self.firstVisibleBlock().blockNumber() + 1
-            col = cursor.columnNumber() + 1
-            self.data_ready.emit(f'\x1b[{row};{col}R'.encode())
-
-    def _handle_device_attributes(self, params: str):
-        """Handle Device Attributes (DA) sequences."""
-        if not params or params == '0':
-            # Report as VT100 with Advanced Video Option
-            self.data_ready.emit(b'\x1b[?1;2c')
-        elif params == '>':  # Secondary Device Attributes
-            # Report as VT220
-            self.data_ready.emit(b'\x1b[>1;10;0c')
-
-    def _handle_tab_control(self, params: str):
-        """Handle tab control sequences."""
-        if not params or params == '0':  # Clear tab at cursor
-            pass  # Implement tab clear
-        elif params == '3':  # Clear all tabs
-            pass  # Implement clear all tabs
-
-    def _handle_scroll_region(self, params: str):
-        """Handle scrolling region (DECSTBM) sequences."""
-        try:
-            if params:
-                top, bottom = map(lambda x: int(x) - 1, params.split(';'))
-                self._scroll_region = (top, bottom)
-            else:
-                self._scroll_region = None
-        except (ValueError, IndexError):
-            self._scroll_region = None
-
-    def _handle_mode_setting(self, command: str, params: str):
-        """Handle mode setting sequences."""
-        set_mode = (command == 'h')
-        if params.startswith('?'):  # Private modes
-            self._handle_private_mode(params[1:], set_mode)
-        else:  # ANSI modes
-            self._handle_ansi_mode(params, set_mode)
-
-    def _handle_private_mode(self, mode: str, set_mode: bool):
-        """Handle private mode settings."""
-        if mode == '1':  # Application Cursor Keys
-            self._application_cursor_keys = set_mode
-        elif mode == '7':  # Auto-wrap Mode
-            self.setLineWrapMode(
-                QPlainTextEdit.WidgetWidth if set_mode
-                else QPlainTextEdit.NoWrap
-            )
-        elif mode == '12':  # Send/receive (SRM)
-            pass  # Not implemented
-        elif mode == '25':  # Show/Hide Cursor
-# This needs to be based on the soft cursor!
-            pass
-        elif mode == '1049':  # Alternate Screen Buffer
-            self._handle_screen_buffer_switch(set_mode)
-        elif mode == '2004':  # Bracketed Paste Mode
-            self._bracketed_paste_mode = set_mode
-        elif mode in ('1001s', '1001r', '1001', '1002', '1006'):  # Mouse tracking modes
-            self._handle_mouse_tracking_mode(mode, set_mode)
-
-    def _handle_mouse_tracking_mode(self, mode: str, set_mode: bool):
-        """Handle mouse tracking mode settings."""
-        if mode == '1001s':  # Save mouse tracking state
-            self._saved_mouse_tracking = self._mouse_tracking
-            self._saved_mouse_tracking_sgr = self._mouse_tracking_sgr
-        elif mode == '1001r':  # Restore mouse tracking state
-            self._mouse_tracking = self._saved_mouse_tracking
-            self._mouse_tracking_sgr = self._saved_mouse_tracking_sgr
-        elif mode == '1001':  # Toggle mouse tracking
-            self._mouse_tracking = set_mode
-        elif mode == '1002':  # Enable mouse button tracking
-            self._mouse_tracking = set_mode
-        elif mode == '1006':  # Enable SGR mouse mode
-            self._mouse_tracking_sgr = set_mode
-
-    def _handle_ansi_mode(self, mode: str, set_mode: bool):
-        """Handle ANSI mode settings."""
-        if mode == '4':  # Insert Mode
-            self.setOverwriteMode(not set_mode)
-        elif mode == '20':  # Automatic Newline
-            pass  # Not implemented
-
-    def _handle_simple_sequence(self, char: str) -> bool:
-        """Handle simple ESC + char sequences."""
-        if char == '7':  # Save Cursor
-            self._saved_cursor_position = (self._cursor_row, self._cursor_col)
-            return True
-
-        if char == '8':  # Restore Cursor
-            if self._saved_cursor_position:
-                row, col = self._saved_cursor_position
-                self._update_cursor_position(row, col)
-            return True
-
-        if char == 'D':  # Index - move cursor down one line
-            if self._cursor_row == self._current_size.rows - 1:
-                self._scroll_region_up(0, self._current_size.rows - 1)
-
-            self._update_cursor_position(self._cursor_row + 1, self._cursor_col)
-
-            return True
-
-        if char == 'M':  # Reverse Index - move cursor up one line
-            if self._cursor_row == 0:
-                self._scroll_region_down(0, self._current_size.rows - 1)
-
-            self._update_cursor_position(self._cursor_row - 1, self._cursor_col)
-
-            return True
-
-        if char == 'E':  # Next Line
-            if self._cursor_row == self._current_size.rows - 1:
-                self._handle_newline_scroll()
-            else:
-                self._update_cursor_position(self._cursor_row + 1, self._cursor_col)
-
-            return True
-
-        if char == 'c':  # Reset to Initial State
-            self.clear()
-            self._current_text_format = QTextCharFormat(self._default_text_format)
-            self._scroll_region = None
-            self._saved_cursor_position = None
-            self._application_cursor_keys = False
-            self._application_keypad_mode = False
-            self._bracketed_paste_mode = False
-            self.setOverwriteMode(True)
-            return True
-
-        return False
-
-    def _handle_osc_sequence(self, sequence: str) -> bool:
-        """Handle Operating System Command (OSC) sequences."""
-        # Extract the OSC command number and parameter
-        parts = sequence[2:].split(';', 1)
-        if not parts:
-            return False
-
-        try:
-            command = int(parts[0])
-            param = parts[1][:-1] if len(parts) > 1 else ''  # Remove terminator
-
-            if command == 0:  # Window title
-                self._logger.debug(f"Window title set to: {param}")
-                return True
-
-            if command == 7:  # Current directory notification
-                if param == 'f':  # Query current directory
-                    if self._current_directory:
-                        response = f"\x1b]7;{self._current_directory}\x1b\\"
-                        self.data_ready.emit(response.encode())
-                else:
-                    self._current_directory = param
-                    self._logger.debug(f"Current directory set to: {param}")
-                return True
-
-            if command in (10, 11):  # Set foreground/background color
-                self._logger.debug(f"Set {'foreground' if command == 10 else 'background'} color: {param}")
-                return True
-
-        except (ValueError, IndexError) as e:
-            self._logger.warning(f"Failed to parse OSC sequence: {sequence}, error: {e}")
-
-        return False
-
-    def _on_scroll_value_changed(self, value: int):
+    def scroll_to(self, position: int) -> None:
         """
-        Handle scroll value changes to detect user scrolling.
+        Scroll terminal to specified position.
 
         Args:
-            value (int): The new scroll value
+            position: Number of lines to scroll up from bottom
         """
-        # Get the vertical scrollbar
-        vbar = self.verticalScrollBar()
+        old_offset = self._viewport_offset
+        self._viewport_offset = min(
+            max(0, position),
+            max(0, len(self._lines) - self._rows)
+        )
 
-        # Check if we're at the bottom
-        at_bottom = value == vbar.maximum()
+        if self._viewport_offset != old_offset:
+            self.update()
 
-        # If user scrolls up, disable auto-scroll
-        if not at_bottom:
-            self._auto_scroll = False
-
-        # If user scrolls to bottom, re-enable auto-scroll
-        if at_bottom:
-            self._auto_scroll = True
-
-    def _on_scroll_range_changed(self, _minimum, _maximum):
-        """Handle the scroll range changing."""
-        # If we're set to auto-scroll then do so now
-        if self._auto_scroll:
-            self._scroll_to_bottom()
-
-    def _scroll_to_bottom(self) -> None:
-        """Scroll to the bottom of the content."""
-        scrollbar = self.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+    def clear(self) -> None:
+        """Clear the terminal."""
+        self._lines = []
+        self._add_new_lines(self._rows)
+        self._cursor_row = 0
+        self._cursor_col = 0
+        self._clear_selection()
+        self.update()
