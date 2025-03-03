@@ -9,7 +9,7 @@ from typing import Optional
 from humbug.gui.color_role import ColorRole
 from humbug.gui.style_manager import StyleManager
 from humbug.language.language_manager import LanguageManager
-
+import logging
 
 class FindWidget(QWidget):
     """Non-modal widget for text find operations."""
@@ -21,6 +21,7 @@ class FindWidget(QWidget):
     def __init__(self, parent=None):
         """Initialize the find widget."""
         super().__init__(parent)
+        self._logger = logging.getLogger("FindWidget")
         self._style_manager = StyleManager()
         self._language_manager = LanguageManager()
 
@@ -243,11 +244,19 @@ class FindWidget(QWidget):
             
         text = self.get_search_text()
         try:
+            # Validate the regexp pattern
             pattern = QRegularExpression(text)
             if not self.is_case_sensitive():
                 pattern.setPatternOptions(QRegularExpression.CaseInsensitiveOption)
+            
+            # Check if the pattern is valid
+            if not pattern.isValid():
+                self._logger.warning(f"Invalid regexp: {pattern.errorString()}")
+                return None
+            
             return pattern
-        except:
+        except Exception as e:
+            self._logger.warning(f"Regexp parsing error: {str(e)}")
             return None
         
     def _handle_options_changed(self):

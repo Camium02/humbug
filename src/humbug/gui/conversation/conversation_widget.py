@@ -1162,10 +1162,7 @@ class ConversationWidget(QWidget):
 
     def find_text(self, text: str, forward: bool = True) -> Tuple[int, int]:
         """Find text in conversation."""
-        # Store the search text
-        self._current_search_text = text
-
-        # Get search options from find widget if available
+        # Get search options from find widget
         case_sensitive = False
         is_regexp = False
         if self._find_widget is not None:
@@ -1174,8 +1171,6 @@ class ConversationWidget(QWidget):
 
         # Track search options to detect changes
         current_options = (text, case_sensitive, is_regexp)
-        # Get searchable widgets
-        widgets = self.get_searchable_widgets()
         
         # Clear existing highlights if search text or options changed
         if text != self._last_search or current_options != getattr(self, '_last_search_options', None):
@@ -1188,20 +1183,17 @@ class ConversationWidget(QWidget):
 
         # Find all matches if this is a new search
         if not self._matches and text:
-            for widget in widgets:
+            for widget in self.get_searchable_widgets():
                 if is_regexp:
-                    try:
-                        pattern = QRegularExpression(text)
-                        if not case_sensitive:
-                            pattern.setPatternOptions(QRegularExpression.CaseInsensitiveOption)
+                    pattern = self._find_widget.get_regexp()
+                    if pattern:  # Only search if we have a valid pattern
                         widget_matches = widget.find_regexp(pattern)
-                    except:
-                        widget_matches = []
+                        if widget_matches:  # Only add if we found matches
+                            self._matches.append((widget, widget_matches))
                 else:
                     widget_matches = widget.find_text(text, case_sensitive)
-
-                if widget_matches:
-                    self._matches.append((widget, widget_matches))
+                    if widget_matches:  # Only add if we found matches
+                        self._matches.append((widget, widget_matches))
 
         if not self._matches:
             return 0, 0
@@ -1219,19 +1211,15 @@ class ConversationWidget(QWidget):
             # Move to next/previous match
             if forward:
                 self._current_match_index += 1
-                # If we've reached the end of matches in current widget
                 if self._current_match_index >= len(self._matches[self._current_widget_index][1]):
                     self._current_widget_index += 1
-                    # If we've reached the end of widgets, wrap around
                     if self._current_widget_index >= len(self._matches):
                         self._current_widget_index = 0
                     self._current_match_index = 0
             else:
                 self._current_match_index -= 1
-                # If we've reached the start of matches in current widget
                 if self._current_match_index < 0:
                     self._current_widget_index -= 1
-                    # If we've reached the start of widgets, wrap around
                     if self._current_widget_index < 0:
                         self._current_widget_index = len(self._matches) - 1
                     self._current_match_index = len(self._matches[self._current_widget_index][1]) - 1

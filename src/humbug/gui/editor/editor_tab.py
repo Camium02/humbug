@@ -668,12 +668,11 @@ class EditorTab(TabBase):
 
     def show_find(self):
         """Show the find widget."""
+        self._editor_widget.set_find_widget(self._find_widget)  # Add this line
         cursor = self._editor_widget.textCursor()
         if cursor.hasSelection():
             # Get the selected text
             text = cursor.selectedText()
-
-            # Only use selection if it's on a single line
             if '\u2029' not in text:  # Qt uses this character for line breaks
                 self._find_widget.set_search_text(text)
             else:
@@ -722,31 +721,65 @@ class EditorTab(TabBase):
         if not forward:
             flags |= QTextDocument.FindBackward
             
-        # Create regexp if needed
+        # Try to find next match
+        found = False
         if is_regexp:
             try:
-                pattern = QRegularExpression(text)
-                if not case_sensitive:
-                    pattern.setPatternOptions(QRegularExpression.CaseInsensitiveOption)
-                # Change this line:
-                found = self._editor_widget.find(pattern, flags)  # Use _editor_widget instead of _editor
-            except:
-                # Invalid regexp
+                pattern = self._find_widget.get_regexp()
+                if pattern:
+                    found = self._editor_widget.find(pattern, flags)
+                else:
+                    # Invalid regexp
+                    found = False
+            except Exception:
                 found = False
         else:
-            # And change this line:
-            found = self._editor_widget.find(text, flags)  # Use _editor_widget instead of _editor
+            found = self._editor_widget.find(text, flags)
             
-        # Update match status
-        # Change this line:
-        cursor = self._editor_widget.textCursor()  # Use _editor_widget instead of _editor
-        if found:
-            self._find_widget.set_match_status(1, 1)  # Basic match status
-        else:
-            self._find_widget.set_match_status(0, 0)
-            # If not found, try wrapping
+        # If not found, wrap around and try again
+        if not found:
+            cursor = self._editor_widget.textCursor()
             cursor.movePosition(
                 QTextCursor.Start if forward else QTextCursor.End
             )
-            # Change this line:
-            self._editor_widget.setTextCursor(cursor)  # Use _editor_widget instead of _editor
+            self._editor_widget.setTextCursor(cursor)
+            
+            # Try search again after wrapping
+            if is_regexp:
+                try:
+                    pattern = self._find_widget.get_regexp()
+                    if pattern:
+                        found = self._editor_widget.find(pattern, flags)
+                    else:
+                        found = False
+                except Exception:
+                    found = False
+            else:
+                found = self._editor_widget.find(text, flags)
+                
+        # Update match status
+        if found:
+            # Find all matches to get total count
+            matches = []
+            cursor = self._editor_widget.textCursor()
+            cursor.movePosition(QTextCursor.Start)
+            doc = self._editor_widget.document()
+            
+            while True:
+                if is_regexp:
+                    pattern = self._find_widget.get_regexp()
+                    cursor = doc.find(pattern, cursor)
+                else:
+                    cursor = doc.find(text, cursor, flags)
+                
+                if cursor.isNull():
+                    break
+                matches.append(cursor.position())
+            
+            # Find current match index
+            current_pos = self._editor_widget.textCursor().position()
+            current_match = next((i+1 for i, pos in enumerate(matches) if pos == current_pos), 1)
+            
+            self._find_widget.set_match_status(current_match, len(matches))
+        else:
+            self._find_widget.set_match_status(0, 0)

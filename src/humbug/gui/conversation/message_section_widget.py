@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QFrame, QTextEdit, QLabel, QHBoxLayout,
     QPushButton, QFileDialog, QWidget
 )
-from PySide6.QtCore import Signal, Qt, QPoint
+from PySide6.QtCore import Signal, Qt, QPoint, QRegularExpression
 from PySide6.QtGui import (
     QCursor, QMouseEvent, QTextCursor, QTextCharFormat, QTextDocument
 )
@@ -306,6 +306,33 @@ class MessageSectionWidget(QFrame):
         """Check if this section contains a code block."""
         return self._text_area.has_code_block()
 
+    def find_regexp(self, pattern: QRegularExpression) -> List[Match]:
+        """Find all occurrences of regexp pattern in this section.
+            
+        Args:
+            pattern: QRegularExpression pattern to search for
+            
+        Returns:
+            List of matches
+        """
+        matches = []
+        document = self._text_area.document()
+        cursor = QTextCursor(document)
+        
+        while True:
+            cursor = document.find(pattern, cursor)
+            if cursor.isNull():
+                break
+            
+            match_text = cursor.selectedText()
+            if match_text:  # Only add non-empty matches
+                matches.append(Match(
+                    start=cursor.selectionStart(),
+                    end=cursor.selectionEnd(),
+                    text=match_text
+                ))
+                
+        return matches
     
     def find_text(self, text: str, case_sensitive: bool = False) -> List[Match]:
         """Find all occurrences of text in this section.

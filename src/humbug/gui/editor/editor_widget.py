@@ -16,6 +16,8 @@ class EditorWidget(QPlainTextEdit):
     def __init__(self, parent: QWidget = None):
         """Initialize the editor."""
         super().__init__(parent)
+        
+        self._find_widget = None
 
         # Enable standard scrollbars
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -51,6 +53,10 @@ class EditorWidget(QPlainTextEdit):
         self._current_match = -1
         self._last_search = ("", False, False)  # (text, case_sensitive, is_regexp)
         self._style_manager.style_changed.connect(self._handle_style_changed)
+        
+    def set_find_widget(self, widget):
+        """Set the reference to the find widget."""
+        self._find_widget = widget
 
     def _handle_language_changed(self) -> None:
         """Handle language changes by updating the UI."""
@@ -462,52 +468,59 @@ class EditorWidget(QPlainTextEdit):
             forward: Whether to search forward from current position
         """
         # Clear existing highlights if search text changed
-        if text != self._last_search:
+        if not text:
             self._clear_highlights()
             self._matches = []
             self._current_match = -1
-            self._last_search = text
+            self._last_search = ""
+            return
+
+        if (text, self._find_widget.is_case_sensitive(), self._find_widget.is_regexp()) != self._last_search:
+            self._clear_highlights()
+            self._matches = []
+            self._current_match = -1
+            self._last_search = (text, self._find_widget.is_case_sensitive(), self._find_widget.is_regexp())
 
         document = self.document()
 
         # Find all matches if this is a new search
-        if not self._matches and text:
+        if not self._matches:
             cursor = QTextCursor(document)
             
-            # Set up find flags based on case sensitivity
-            find_flags = QTextDocument.FindFlags()
-            if self.find_widget.is_case_sensitive():
-                find_flags |= QTextDocument.FindCaseSensitively
-
-            if self.find_widget.is_regexp():
-                # Use regular expression search
-                try:
-                    pattern = re.compile(
-                        text,
-                        re.IGNORECASE if not self.find_widget.is_case_sensitive() else 0
-                    )
-                    content = document.toPlainText()
-                    for match in pattern.finditer(content):
-                        self._matches.append((match.start(), match.end()))
-                except re.error:
-                    # Invalid regular expression
-                    return
+            if self._find_widget and self._find_widget.is_regexp():
+                # Use QRegularExpression search
+                pattern = self._find_widget.get_regexp()
+                if pattern:
+                    while True:
+                        cursor = document.find(pattern, cursor)
+                        if cursor.isNull():
+                            break
+                        self._matches.append((cursor.selectionStart(), cursor.selectionEnd()))
             else:
                 # Use normal text search
+                flags = QTextDocument.FindFlags()
+                if self._find_widget and self._find_widget.is_case_sensitive():
+                    flags |= QTextDocument.FindCaseSensitively
+                    
                 while True:
-                    cursor = document.find(text, cursor, find_flags)
+                    cursor = document.find(text, cursor, flags)
                     if cursor.isNull():
                         break
                     self._matches.append((cursor.selectionStart(), cursor.selectionEnd()))
 
         if not self._matches:
+            if self._find_widget:
+                self._find_widget.set_match_status(0, 0)
             return
 
         # Move to next/previous match
-        if forward:
-            self._current_match = (self._current_match + 1) % len(self._matches)
+        if self._current_match == -1:
+            self._current_match = 0
         else:
-            self._current_match = (self._current_match - 1) if self._current_match > 0 else len(self._matches) - 1
+            if forward:
+                self._current_match = (self._current_match + 1) % len(self._matches)
+            else:
+                self._current_match = (self._current_match - 1) if self._current_match > 0 else len(self._matches) - 1
 
         # Highlight all matches
         self._highlight_matches()
@@ -516,8 +529,8 @@ class EditorWidget(QPlainTextEdit):
         self._scroll_to_match(self._current_match)
 
         # Update the find widget with match status
-        if self.find_widget:
-            self.find_widget.set_match_status(
+        if self._find_widget:
+            self._find_widget.set_match_status(
                 self._current_match + 1,  # Convert to 1-based indexing for display
                 len(self._matches)
             )

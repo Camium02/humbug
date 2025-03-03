@@ -176,7 +176,7 @@ class MessageWidget(QFrame):
         except Exception:
             self._logger.exception("highlighting exception")
 
-    def _parse_content_sections(self, text: str) -> List[tuple]:
+    def _parse_content_sections(self, text: str) -> List[Match]:
         """
         Parse content into sections with associated languages.
 
@@ -433,19 +433,27 @@ class MessageWidget(QFrame):
         return matches
 
     def find_regexp(self, pattern: QRegularExpression) -> List[Match]:
-        """Find regexp pattern in all sections."""
+        """Find regexp pattern in all sections.
+        
+        Args:
+            pattern: QRegularExpression to search for
+            
+        Returns:
+            List of matches
+        """
         matches = []
         for section in self._sections:
             section_matches = section.find_regexp(pattern)
-            matches.extend(section_matches)
+            if section_matches:  # Only extend if we found matches
+                matches.extend(section_matches)
         return matches
 
-    def highlight_matches(
-        self,
-        matches: List[Match],
-        current_match_index: int = -1,
-        highlight_color=None,
-        dim_highlight_color=None
+    def highlight_matches(  
+    self,
+    matches: List[Match],
+    current_match_index: int = -1,
+    highlight_color=None,
+    dim_highlight_color=None
     ):
         """
         Highlight matches in this message.
@@ -460,33 +468,31 @@ class MessageWidget(QFrame):
         self.clear_highlights()
 
         # Group matches by section
-        section_matches: Dict[MessageSectionWidget, List[Tuple[int, int, int]]] = {}
-        match_index = 0
+        section_matches: Dict[MessageSectionWidget, List[Tuple[int, int]]] = {}
 
-        for _section_idx, section in enumerate(self._sections):
+        for section in self._sections:
             section_matches[section] = []
-
-            # Pass the actual text to search for
-            search_text = matches[0].text if matches else ""
-            for match in section.find_text(search_text):
-                # Store match with global index
-                section_matches[section].append((match.start, match.end, match_index))
-                match_index += 1
+            
+            # Check each match to see if it belongs in this section
+            for match in matches:
+                # Get the character at match position
+                char = section._text_area.document().characterAt(match.start)
+                if char:  # If we found a character, this match belongs to this section
+                    section_matches[section].append((match.start, match.end))
 
         # Highlight matches in each section
-        for section, matches_with_index in section_matches.items():
-            if not matches_with_index:
+        for section, positions in section_matches.items():
+            if not positions:
                 continue
-
-            # Extract just the position info
-            positions = [(start, end) for start, end, _ in matches_with_index]
 
             # Find if current match is in this section
             section_current_idx = -1
-            for i, (_, _, idx) in enumerate(matches_with_index):
-                if idx == current_match_index:
-                    section_current_idx = i
-                    break
+            if current_match_index >= 0 and current_match_index < len(matches):
+                current_match = matches[current_match_index]
+                try:
+                    section_current_idx = positions.index((current_match.start, current_match.end))
+                except ValueError:
+                    pass
 
             # Highlight this section's matches
             section.highlight_matches(
