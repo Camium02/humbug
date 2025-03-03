@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QFileDialog
 )
 from PySide6.QtCore import QTimer
-from PySide6.QtGui import QTextCursor
+from PySide6.QtGui import QTextDocument, QTextCursor, QRegularExpressionValidator
 
 from humbug.gui.color_role import ColorRole
 from humbug.gui.editor.editor_highlighter import EditorHighlighter
@@ -687,9 +687,62 @@ class EditorTab(TabBase):
         self._find_widget.hide()
         self._editor_widget.clear_find()
 
-    def _find_next(self, forward: bool = True):
-        """Find next/previous match."""
+    def _handle_find_next(self) -> None:
+        """Handle find next signal from find widget."""
+        self.find_text(
+            self._find_widget.get_search_text(),
+            forward=True,
+            case_sensitive=self._find_widget.is_case_sensitive(),
+            is_regexp=self._find_widget.is_regexp()
+        )
+
+    def _handle_find_previous(self) -> None:
+        """Handle find previous signal from find widget."""
+        self.find_text(
+            self._find_widget.get_search_text(),
+            forward=False,
+            case_sensitive=self._find_widget.is_case_sensitive(),
+            is_regexp=self._find_widget.is_regexp()
+        )
+        
+    def _find_next(self, forward: bool = True) -> None:
+        """Find next occurrence of search text.
+        
+        Args:
+            forward: Whether to search forward (True) or backward (False)
+        """
         text = self._find_widget.get_search_text()
-        self._editor_widget.find_text(text, forward)
-        current, total = self._editor_widget.get_match_status()
-        self._find_widget.set_match_status(current, total)
+        case_sensitive = self._find_widget.is_case_sensitive()
+        is_regexp = self._find_widget.is_regexp()
+        
+        # Set up find flags
+        flags = QTextDocument.FindFlags()
+        if case_sensitive:
+            flags |= QTextDocument.FindCaseSensitively
+        if not forward:
+            flags |= QTextDocument.FindBackward
+            
+        # Create regexp if needed
+        if is_regexp:
+            try:
+                pattern = QRegularExpression(text)
+                if not case_sensitive:
+                    pattern.setPatternOptions(QRegularExpression.CaseInsensitiveOption)
+                found = self._editor.find(pattern, flags)
+            except:
+                # Invalid regexp
+                found = False
+        else:
+            found = self._editor.find(text, flags)
+            
+        # Update match status
+        cursor = self._editor.textCursor()
+        if found:
+            self._find_widget.set_match_status(1, 1)  # Basic match status
+        else:
+            self._find_widget.set_match_status(0, 0)
+            # If not found, try wrapping
+            cursor.movePosition(
+                QTextCursor.Start if forward else QTextCursor.End
+            )
+            self._editor.setTextCursor(cursor)

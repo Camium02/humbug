@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Signal, Qt, QPoint
 from PySide6.QtGui import (
-    QCursor, QMouseEvent, QTextCursor, QTextCharFormat
+    QCursor, QMouseEvent, QTextCursor, QTextCharFormat, QTextDocument
 )
 
 from humbug.gui.conversation.conversation_highlighter import ConversationHighlighter
@@ -18,6 +18,7 @@ from humbug.gui.style_manager import StyleManager
 from humbug.syntax.programming_language import ProgrammingLanguage
 from humbug.gui.message_box import MessageBox, MessageBoxType
 from humbug.language.language_manager import LanguageManager
+from humbug.gui.types import Match
 
 
 class MessageSectionWidget(QFrame):
@@ -305,27 +306,35 @@ class MessageSectionWidget(QFrame):
         """Check if this section contains a code block."""
         return self._text_area.has_code_block()
 
-    def find_text(self, text: str) -> List[Tuple[int, int]]:
-        """
-        Find all instances of text in this section.
-
-        Args:
-            text: Text to search for
-
-        Returns:
-            List of (start_position, end_position) tuples for each match
-        """
-        document = self._text_area.document()
+    
+    def find_text(self, text: str, case_sensitive: bool = False) -> List[Match]:
+        """Find all occurrences of text in this section.
+            
+            Args:
+                text: Text to search for
+                case_sensitive: Whether to match case
+                
+            Returns:
+                List of matches
+            """
         matches = []
+        document = self._text_area.document()
         cursor = QTextCursor(document)
-
+        
+        flags = QTextDocument.FindFlags()
+        if case_sensitive:
+            flags |= QTextDocument.FindCaseSensitively
+            
         while True:
-            cursor = document.find(text, cursor)
+            cursor = document.find(text, cursor, flags)
             if cursor.isNull():
                 break
-
-            matches.append((cursor.selectionStart(), cursor.selectionEnd()))
-
+            matches.append(Match(
+                start=cursor.selectionStart(),
+                end=cursor.selectionEnd(),
+                text=cursor.selectedText()
+            ))
+            
         return matches
 
     def highlight_matches(

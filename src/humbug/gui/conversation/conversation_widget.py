@@ -27,6 +27,7 @@ from humbug.language.language_manager import LanguageManager
 from humbug.mindspace.mindspace_manager import MindspaceManager
 from humbug.transcript.transcript_error import TranscriptError
 from humbug.transcript.transcript_handler import TranscriptHandler
+from humbug.gui.find_widget import FindWidget
 
 
 @dataclass
@@ -81,6 +82,7 @@ class ConversationWidget(QWidget):
             parent: Optional parent widget
         """
         super().__init__(parent)
+        self._find_widget = None
         self._logger = logging.getLogger("ConversationWidget")
         self._conversation_id = conversation_id
         self._path = path
@@ -278,6 +280,10 @@ class ConversationWidget(QWidget):
             temperature=self._settings.temperature,
             reasoning=self._settings.reasoning
         )
+
+    def set_find_widget(self, find_widget: FindWidget) -> None:
+        """Set the find widget reference."""
+        self._find_widget = find_widget
 
     @Slot(int)
     def _on_scroll_value_changed(self, value: int):
@@ -1154,19 +1160,18 @@ class ConversationWidget(QWidget):
         """
         return self._messages + [self._input]
 
-    # Integrated find functionality from ConversationFind
-
     def find_text(self, text: str, forward: bool = True) -> Tuple[int, int]:
-        """
-        Find all instances of text and highlight them.
+        """Find text in conversation."""
+        # Store the search text
+        self._current_search_text = text
 
-        Args:
-            text: Text to search for
-            forward: Whether to search forward from current position
+        # Get search options from find widget if available
+        case_sensitive = False
+        is_regexp = False
+        if self._find_widget is not None:
+            case_sensitive = self._find_widget.is_case_sensitive()
+            is_regexp = self._find_widget.is_regexp()
 
-        Returns:
-            Tuple of (current_match, total_matches)
-        """
         # Get searchable widgets
         widgets = self.get_searchable_widgets()
 
@@ -1181,7 +1186,16 @@ class ConversationWidget(QWidget):
         # Find all matches if this is a new search
         if not self._matches and text:
             for widget in widgets:
-                widget_matches = widget.find_text(text)
+                if is_regexp:
+                    try:
+                        pattern = QRegularExpression(text)
+                        if not case_sensitive:
+                            pattern.setPatternOptions(QRegularExpression.CaseInsensitiveOption)
+                        widget_matches = widget.find_regexp(pattern)
+                    except:
+                        widget_matches = []
+                else:
+                    widget_matches = widget.find_text(text, case_sensitive)
 
                 if widget_matches:
                     self._matches.append((widget, widget_matches))
@@ -1253,10 +1267,10 @@ class ConversationWidget(QWidget):
             return
 
         widget, matches = self._matches[self._current_widget_index]
-        start, _ = matches[self._current_match_index]
-
-        # Trigger scrolling to this position
-        self.handle_find_scroll(widget, start)
+        match = matches[self._current_match_index]  # This is a Match object
+        
+        # Trigger scrolling to this position using the start position
+        self.handle_find_scroll(widget, match.start)
 
     def _clear_highlights(self) -> None:
         """Clear all search highlights."""

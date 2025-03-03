@@ -80,6 +80,9 @@ class ConversationTab(TabBase):
         self._conversation_widget.status_updated.connect(self.update_status)
         self._conversation_widget.bookmarkNavigationRequested.connect(self.bookmarkNavigationRequested)
         layout.addWidget(self._conversation_widget)
+        
+        # Set the find widget reference
+        self._conversation_widget.set_find_widget(self._find_widget)
 
         # Install activation tracking
         self._install_activation_tracking(self._conversation_widget)

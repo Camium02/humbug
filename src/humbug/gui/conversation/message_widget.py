@@ -6,7 +6,7 @@ from typing import List, Tuple, Dict, Optional
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QLabel, QHBoxLayout, QWidget
 )
-from PySide6.QtCore import Signal, QPoint
+from PySide6.QtCore import Signal, QPoint, QRegularExpression
 
 from humbug.conversation.message_source import MessageSource
 from humbug.gui.conversation.message_section_widget import MessageSectionWidget
@@ -15,6 +15,7 @@ from humbug.gui.style_manager import StyleManager
 from humbug.language.language_manager import LanguageManager
 from humbug.syntax.conversation_parser import ConversationParser, ConversationParserState
 from humbug.syntax.programming_language import ProgrammingLanguage
+from humbug.gui.types import Match
 
 
 class MessageWidget(QFrame):
@@ -414,26 +415,34 @@ class MessageWidget(QFrame):
             }}
         """)
 
-    def find_text(self, text: str) -> List[Tuple[int, int]]:
-        """
-        Find all instances of text in this message.
-
+    # In MessageWidget class:
+    def find_text(self, text: str, case_sensitive: bool = False) -> List[Match]:
+        """Find text in all sections.
+        
         Args:
             text: Text to search for
-
+            case_sensitive: Whether to match case
+            
         Returns:
-            List of (start_position, end_position) tuples for each match
+            List of matches
         """
-        all_matches = []
+        matches = []
         for section in self._sections:
-            section_matches = section.find_text(text)
-            if section_matches:
-                all_matches.extend(section_matches)
-        return all_matches
+            section_matches = section.find_text(text, case_sensitive)
+            matches.extend(section_matches)
+        return matches
+
+    def find_regexp(self, pattern: QRegularExpression) -> List[Match]:
+        """Find regexp pattern in all sections."""
+        matches = []
+        for section in self._sections:
+            section_matches = section.find_regexp(pattern)
+            matches.extend(section_matches)
+        return matches
 
     def highlight_matches(
         self,
-        matches: List[Tuple[int, int]],
+        matches: List[Match],
         current_match_index: int = -1,
         highlight_color=None,
         dim_highlight_color=None
@@ -442,10 +451,10 @@ class MessageWidget(QFrame):
         Highlight matches in this message.
 
         Args:
-            matches: List of (start, end) tuples to highlight
+            matches: List of Match objects to highlight
             current_match_index: Index of current match to highlight differently, or -1 for none
-            highlight_color: QColor for current match, defaults to system highlight color
-            dim_highlight_color: QColor for other matches, defaults to dimmer highlight color
+            highlight_color: QColor for current match
+            dim_highlight_color: QColor for other matches
         """
         # First clear all highlights
         self.clear_highlights()
@@ -457,10 +466,11 @@ class MessageWidget(QFrame):
         for _section_idx, section in enumerate(self._sections):
             section_matches[section] = []
 
-            # Find matches in this section
-            for match in section.find_text(matches[0][0] if matches else ""):
+            # Pass the actual text to search for
+            search_text = matches[0].text if matches else ""
+            for match in section.find_text(search_text):
                 # Store match with global index
-                section_matches[section].append((match[0], match[1], match_index))
+                section_matches[section].append((match.start, match.end, match_index))
                 match_index += 1
 
         # Highlight matches in each section

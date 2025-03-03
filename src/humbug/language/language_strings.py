@@ -185,3 +185,7 @@ class LanguageStrings:
     rename_error_generic: str
     file_creation_error_title: str
     file_creation_error: str
+    
+    # Find filters
+    find_case_sensitive: str
+    find_regexp: str

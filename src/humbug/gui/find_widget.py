@@ -3,9 +3,9 @@
 from PySide6.QtWidgets import (
     QWidget, QHBoxLayout, QLineEdit, QToolButton, QLabel
 )
-from PySide6.QtCore import Signal, Qt, QSize
-from PySide6.QtGui import QIcon, QFocusEvent
-
+from PySide6.QtCore import Signal, Qt, QSize, QRegularExpression
+from PySide6.QtGui import QIcon, QFocusEvent, QTextDocument
+from typing import Optional
 from humbug.gui.color_role import ColorRole
 from humbug.gui.style_manager import StyleManager
 from humbug.language.language_manager import LanguageManager
@@ -36,6 +36,22 @@ class FindWidget(QWidget):
         self._search_input.returnPressed.connect(self.find_next)
         layout.addWidget(self._search_input)
 
+        # Add case sensitive toggle
+        self._case_sensitive_button = QToolButton()
+        self._case_sensitive_button.setCheckable(True)
+        self._case_sensitive_button.setText("aA")
+        self._case_sensitive_button.setToolTip(self._language_manager.strings.find_case_sensitive)
+        self._case_sensitive_button.clicked.connect(self._handle_text_changed)
+        layout.addWidget(self._case_sensitive_button)
+
+        # Add regexp toggle
+        self._regexp_button = QToolButton()
+        self._regexp_button.setCheckable(True)
+        self._regexp_button.setText(".*")
+        self._regexp_button.setToolTip(self._language_manager.strings.find_regexp)
+        self._regexp_button.clicked.connect(self._handle_text_changed)
+        layout.addWidget(self._regexp_button)
+
         # Add status label
         self._status_label = QLabel()
         layout.addWidget(self._status_label)
@@ -62,9 +78,19 @@ class FindWidget(QWidget):
         self._style_manager.style_changed.connect(self._handle_style_changed)
         self._language_manager.language_changed.connect(self._handle_language_changed)
 
+    def is_case_sensitive(self) -> bool:
+        """Return whether case-sensitive search is enabled."""
+        return self._case_sensitive_button.isChecked()
+
+    def is_regexp(self) -> bool:
+        """Return whether regexp search is enabled."""
+        return self._regexp_button.isChecked()
+
     def _handle_language_changed(self) -> None:
         strings = self._language_manager.strings
         self._search_input.setPlaceholderText(strings.find_placeholder)
+        self._case_sensitive_button.setToolTip(strings.find_case_sensitive)
+        self._regexp_button.setToolTip(strings.find_regexp)
         self._update_match_status()
         self._handle_style_changed()
 
@@ -94,6 +120,16 @@ class FindWidget(QWidget):
         self._prev_button.setIconSize(icon_size)
         self._next_button.setIconSize(icon_size)
         self._close_button.setIconSize(icon_size)
+
+        # Add styles for toggle buttons
+        toggle_button_style = f"""
+            QToolButton[checkable="true"] {{
+                background-color: {self._style_manager.get_color_str(ColorRole.BUTTON_BACKGROUND)};
+            }}
+            QToolButton[checkable="true"]:checked {{
+                background-color: {self._style_manager.get_color_str(ColorRole.BUTTON_BACKGROUND_PRESSED)};
+            }}
+        """
 
         self.setStyleSheet(f"""
             QWidget {{
@@ -129,6 +165,7 @@ class FindWidget(QWidget):
                 border: none;
                 padding: 2px;
             }}
+            {toggle_button_style}
         """)
 
     def keyPressEvent(self, event):
@@ -191,3 +228,24 @@ class FindWidget(QWidget):
         """Set the search text and trigger a search."""
         self._search_input.setText(text)
         self._search_input.selectAll()
+        
+    def get_search_flags(self) -> QTextDocument.FindFlags:
+        """Get the current search flags based on settings."""
+        flags = QTextDocument.FindFlags()
+        if self.is_case_sensitive():
+            flags |= QTextDocument.FindCaseSensitively
+        return flags
+
+    def get_regexp(self) -> Optional[QRegularExpression]:
+        """Get regexp pattern if regexp mode is enabled."""
+        if not self.is_regexp():
+            return None
+            
+        text = self.get_search_text()
+        try:
+            pattern = QRegularExpression(text)
+            if not self.is_case_sensitive():
+                pattern.setPatternOptions(QRegularExpression.CaseInsensitiveOption)
+            return pattern
+        except:
+            return None

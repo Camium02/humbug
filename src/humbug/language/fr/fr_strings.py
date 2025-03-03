@@ -189,5 +189,10 @@ def get_french_strings() -> LanguageStrings:
         rename_error_exists="Un fichier avec ce nom existe déjà.",
         rename_error_generic="Impossible de renommer le fichier : ",
         file_creation_error_title="Erreur de création de fichier",
-        file_creation_error="Impossible de créer le fichier : "
+        file_creation_error="Impossible de créer le fichier : ",
+        
+        # Find Filters
+        find_case_sensitive = "Cas de match",
+        find_regexp = "Utiliser une expression régulière"
+    
     )

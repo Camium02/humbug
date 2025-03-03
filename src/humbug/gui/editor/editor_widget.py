@@ -49,7 +49,7 @@ class EditorWidget(QPlainTextEdit):
         # Initialize find functionality
         self._matches: List[Tuple[int, int]] = []  # List of (start, end) positions
         self._current_match = -1
-        self._last_search = ""
+        self._last_search = ("", False, False)  # (text, case_sensitive, is_regexp)
         self._style_manager.style_changed.connect(self._handle_style_changed)
 
     def _handle_language_changed(self) -> None:
@@ -473,11 +473,32 @@ class EditorWidget(QPlainTextEdit):
         # Find all matches if this is a new search
         if not self._matches and text:
             cursor = QTextCursor(document)
-            while True:
-                cursor = document.find(text, cursor)
-                if cursor.isNull():
-                    break
-                self._matches.append((cursor.selectionStart(), cursor.selectionEnd()))
+            
+            # Set up find flags based on case sensitivity
+            find_flags = QTextDocument.FindFlags()
+            if self.find_widget.is_case_sensitive():
+                find_flags |= QTextDocument.FindCaseSensitively
+
+            if self.find_widget.is_regexp():
+                # Use regular expression search
+                try:
+                    pattern = re.compile(
+                        text,
+                        re.IGNORECASE if not self.find_widget.is_case_sensitive() else 0
+                    )
+                    content = document.toPlainText()
+                    for match in pattern.finditer(content):
+                        self._matches.append((match.start(), match.end()))
+                except re.error:
+                    # Invalid regular expression
+                    return
+            else:
+                # Use normal text search
+                while True:
+                    cursor = document.find(text, cursor, find_flags)
+                    if cursor.isNull():
+                        break
+                    self._matches.append((cursor.selectionStart(), cursor.selectionEnd()))
 
         if not self._matches:
             return
@@ -493,6 +514,13 @@ class EditorWidget(QPlainTextEdit):
 
         # Scroll to current match
         self._scroll_to_match(self._current_match)
+
+        # Update the find widget with match status
+        if self.find_widget:
+            self.find_widget.set_match_status(
+                self._current_match + 1,  # Convert to 1-based indexing for display
+                len(self._matches)
+            )
 
     def _highlight_matches(self) -> None:
         """Update the highlighting of all matches."""
