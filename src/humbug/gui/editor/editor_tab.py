@@ -728,15 +728,18 @@ class EditorTab(TabBase):
                 pattern = QRegularExpression(text)
                 if not case_sensitive:
                     pattern.setPatternOptions(QRegularExpression.CaseInsensitiveOption)
-                found = self._editor.find(pattern, flags)
+                # Change this line:
+                found = self._editor_widget.find(pattern, flags)  # Use _editor_widget instead of _editor
             except:
                 # Invalid regexp
                 found = False
         else:
-            found = self._editor.find(text, flags)
+            # And change this line:
+            found = self._editor_widget.find(text, flags)  # Use _editor_widget instead of _editor
             
         # Update match status
-        cursor = self._editor.textCursor()
+        # Change this line:
+        cursor = self._editor_widget.textCursor()  # Use _editor_widget instead of _editor
         if found:
             self._find_widget.set_match_status(1, 1)  # Basic match status
         else:
@@ -745,4 +748,5 @@ class EditorTab(TabBase):
             cursor.movePosition(
                 QTextCursor.Start if forward else QTextCursor.End
             )
-            self._editor.setTextCursor(cursor)
+            # Change this line:
+            self._editor_widget.setTextCursor(cursor)  # Use _editor_widget instead of _editor

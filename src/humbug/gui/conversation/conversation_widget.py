@@ -1172,16 +1172,19 @@ class ConversationWidget(QWidget):
             case_sensitive = self._find_widget.is_case_sensitive()
             is_regexp = self._find_widget.is_regexp()
 
+        # Track search options to detect changes
+        current_options = (text, case_sensitive, is_regexp)
         # Get searchable widgets
         widgets = self.get_searchable_widgets()
-
-        # Clear existing highlights if search text changed
-        if text != self._last_search:
+        
+        # Clear existing highlights if search text or options changed
+        if text != self._last_search or current_options != getattr(self, '_last_search_options', None):
             self._clear_highlights()
             self._matches = []
             self._current_widget_index = -1
             self._current_match_index = -1
             self._last_search = text
+            self._last_search_options = current_options
 
         # Find all matches if this is a new search
         if not self._matches and text:

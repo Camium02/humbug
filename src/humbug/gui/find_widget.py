@@ -249,3 +249,7 @@ class FindWidget(QWidget):
             return pattern
         except:
             return None
+        
+    def _handle_options_changed(self):
+        """Handle changes to search options."""
+        self.find_next.emit()  # Trigger a new search with updated options
